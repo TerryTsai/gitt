@@ -1,15 +1,14 @@
 # gitt
 
-A standalone browser for local Git repositories. Read code, compare changes, and create empty repositories from a phone or desktop.
+A standalone browser for local Git repositories. Read code, explore history, and create empty repositories from a phone or desktop.
 
 ![gitt showing a repository on a phone-sized screen](docs/screenshots/mobile.png)
 
 ## Highlights
 
 - Browse existing bare repositories and working checkouts without migration.
-- Inspect files, branches, tags, history, commit diffs, and two-snapshot comparisons.
-- See staged, unstaged, and nonignored untracked changes in a live checkout.
-- Search repository names and file paths. Read Markdown, highlighted source, and raw files.
+- Inspect committed files, branches, tags, and history.
+- Open the fixed **Search** button to search repository names or committed file paths within one selected repository. Read Markdown and highlighted source.
 - Create empty bare repositories or checkouts, including grouped paths.
 - Semantic HTML, small CSS, and no JavaScript, external fonts, or browser dependencies.
 - One executable. No runtime Git, database, CGI, or companion service.
@@ -42,7 +41,7 @@ mkdir -p "$HOME/repositories"
 "$HOME/.local/bin/gitt" "$HOME/repositories"
 ```
 
-Open <http://127.0.0.1:8080>. Use **Create repository** to create an empty repository, or put existing repositories in the directory using your normal tools. A structure such as this works:
+Open <http://127.0.0.1:8080>. Use **Create** to create an empty repository, or put existing repositories in the directory using your normal tools. A structure such as this works:
 
 ```text
 repositories/
@@ -52,11 +51,13 @@ repositories/
     parser.git/        grouped bare repository
 ```
 
-Discovery is recursive and stops at each repository. Symlink directories are skipped. A checkout edited in this directory shows its live files; a clone elsewhere does not appear here. Refresh or follow a link to see updates.
+Discovery is recursive and stops at each repository. Symlink directories are skipped. Both repository layouts expose committed Git content only. Staged, unstaged, and untracked files are not shown. New repository views start on the HEAD branch. Navigation keeps the selected branch, tag, or commit.
 
-Open **Menu** for repository navigation. **Files** opens the working files of a checkout or the default branch of a bare repository. **Branches & tags** opens a committed snapshot. **Changes** separates staged, unstaged, and untracked content. **Compare** compares the two selected trees directly. Merge commits show their first-parent diff and all parent IDs.
+**Files** opens committed content on the selected revision. **Branches**, **Tags**, and **History** let you select another revision with an ordinary link that reloads the same page. Its route, file path, filters, and pagination stay unchanged. Named selections stay named through tabs, breadcrumbs, Markdown links, and search; commit selections retain their hash. Repositories without commits show an empty state. Compare and commit detail views have been removed.
 
-On a file page, follow the linked path to its parent directory. Expand **Working tree** or **Snapshot** for repository details and the configured SSH clone URL; use **Raw** to download the file. These compact controls are in the current source and LAN preview; the published v0.1.0 archives use the earlier layout.
+Use the header breadcrumbs to move through directories; **…** opens the parent folders without adding another header row. The selected branch, tag, or commit appears as plain text at the right of the tabs. Configured SSH clone URLs appear at the repository root. **Search** stays fixed at the top right and opens one page for repository-name or selected-repository file-path search. Opening it from a repository preserves that repository and selected revision. **Create** is a matching button beside Search on the home page; its checked **Bare** toggle controls the new repository layout. These controls and committed-only browsing are in the current source and deployment; the published v0.1.0 archives retain the earlier behavior.
+
+Repository listings show the revision, latest commit, author, and commit age. They default to HEAD; selecting a revision updates that repository’s row and keeps the selection when opening it. Empty repositories keep their branch name and show dashes for commit metadata; unavailable repositories remain listed with dashes. File listings show size and the last commit affecting each path, including its author and age. Directory history includes descendants; age is Git commit time, not clone time. Every list uses a single line per item with separate columns, including on phones. Wide lists scroll horizontally without wrapping or hiding columns. All list views share the same compact row spacing, column alignment, link styling, and hairline separators; all row text uses the same font and size except commit hashes. Modes use readable permissions such as `rw- r-- r--`; directories show `-`, while symlinks and submodules show their kind. History lookup is bounded; unavailable metadata is shown as a dash with a notice when a limit or incomplete history prevented lookup.
 
 For LAN access, explicitly bind a network interface and set the URL people will use:
 
@@ -88,26 +89,27 @@ There is no configuration database. See [OpenRC](deploy/gitt.openrc), its [confi
 
 There are no application accounts. Anyone who can reach the configured origin can read and create repositories. Keep access on localhost or your intended trusted network. For a reverse proxy, set `--origin` to the external URL and preserve that URL's `Host` header; forwarded headers are not used. TLS and any access control belong at the proxy or network boundary.
 
-The watched root is an explicit publication boundary. Tracked files and history remain visible even if their paths now match ignore rules. Nonignored untracked files are visible too. Repository hooks, executable filters, remote fetching, and symlink targets are never run or followed by gitt. Worktree files requiring Git clean/text conversion receive an explicit limitation instead of a false clean result.
+The watched root is an explicit publication boundary. Committed files and history remain visible even if their paths now match ignore rules. Content only in the index or working directory is excluded. Repository hooks, executable filters, remote fetching, and symlink targets are never run or followed by gitt.
 
 ## Limits
 
 | Operation | Limit |
 | --- | --- |
-| Source preview / each diff side | 1 MiB and 20,000 lines |
+| Source preview | 1 MiB and 20,000 lines |
 | Syntax highlighting | 256 KiB; lines up to 8 KiB; bounded work with plain-text fallback |
 | Committed raw file | 8 MiB; larger objects use local Git or SSH |
-| Working-file raw download | Streamed through a checked descriptor |
 | Rendered page | 2 MiB |
 | Discovery | 10,000 directories, 1,000 repositories, 64 levels |
 | List / history page | 200 entries / 50 commits |
+| File-list history metadata | 75 ms cooperative lookup budget; up to 512 commits for the visible page |
 | Concurrent work | 2 active operations, 4 waiting, 16 HTTP connections |
+| Response wait | Up to 2 seconds queued, then 10 seconds for browsing or 30 seconds for creation |
 
-Limits and omitted results are shown in the page. Working-tree views are observations of files that may change while being read. A response timeout cannot interrupt an already-running native Git operation; its work slot stays occupied until it finishes. The separate 24 MiB native Git allocation budget is not a whole-process RSS cap.
+Limits and omitted results are shown in the page. File links, raw downloads, Markdown links, and search results retain the selected branch, tag, or commit. A response timeout cannot interrupt an already-running native Git operation; its work slot stays occupied until it finishes. Slow operations (500 ms or more), queue exhaustion, and timeouts are logged with route and timing, without query parameters. The separate 24 MiB native Git allocation budget is not a whole-process RSS cap.
 
-Self-contained SHA-1 repositories with ordinary loose/packed objects and refs are supported. SHA-256, reftable, linked worktrees, separate Git directories, object alternates, sparse indexes, and split indexes are rejected with explanations. Submodule IDs and LFS pointer files can be inspected; their contents are not fetched.
+Self-contained SHA-1 repositories with ordinary loose/packed objects and refs are supported. SHA-256, reftable, linked worktrees, separate Git directories, object alternates are rejected with explanations. Submodule IDs and LFS pointer files can be inspected; their contents are not fetched.
 
-Highlighting includes Rust, Python, C, C++, JavaScript, JSON, HTML, CSS, shell, YAML, Markdown, and SQL. Unknown languages and expensive inputs remain readable as plain text. Renames appear as additions and deletions. Search covers names and paths, not file contents.
+Highlighting includes Rust, Python, C, C++, JavaScript, JSON, HTML, CSS, shell, YAML, Markdown, and SQL. Unknown languages and expensive inputs remain readable as plain text. Search covers repository names and file paths within one selected repository, not file contents. The index is not read, so working-tree and index state do not affect browsing.
 
 ## Performance
 
