@@ -1,0 +1,204 @@
+{
+  "schema": 1,
+  "version": "0.1.0",
+  "measured_at_utc": "2026-11-13T07:06:29.807846+00:00",
+  "host": {
+    "cpu": "Intel Core i5-4570T, 2 cores / 4 logical CPUs",
+    "ram_kib": 8041400,
+    "os": "Alpine Linux 3.23.4",
+    "kernel": "6.18.33-0-lts x86_64",
+    "storage": "PNY CS900 500GB SATA SSD, ext4",
+    "load_average_before": "0.00 0.00 0.00"
+  },
+  "build": {
+    "rust": "1.95.0",
+    "c_compiler": "Zig cc 0.17.1, x86_64-linux-musl",
+    "profile": "release, opt-level=s, LTO, 1 codegen unit, stripped, panic=abort",
+    "binary_bytes": 3602224,
+    "binary_sha256": "8c470e3ec702a64ec95f635543fe44abd2035762fa2703b6968410bc90f60843"
+  },
+  "fixture_summary": {
+    "repositories": 300,
+    "ordinary_tracked_paths": 21,
+    "ordinary_history_commits": 62,
+    "source_bytes": [
+      3564,
+      65536
+    ],
+    "staged_paths": 3,
+    "unstaged_paths": 4,
+    "nonignored_untracked_paths": 1,
+    "large_repository_blob_bytes": 1073741824,
+    "large_blob_bytes": 67108864,
+    "large_blob_count": 16,
+    "pack_layout": "One pack per ordinary populated repo; one large pack; independent object files, no shared hardlinks",
+    "language_mix": "Rust, Markdown, plain text"
+  },
+  "transport": "HTTP over LAN; SSH process control and /proc sampling",
+  "cache_conditions": "Fresh processes for startup; filesystem caches are not dropped. Latency follows per-endpoint warmup.",
+  "readers": 3,
+  "clock_ticks_per_second": 100,
+  "clock_ticks_source": "getconf CLK_TCK on target",
+  "startup": {
+    "count": 10,
+    "p50_ms": 257.623,
+    "p95_ms": 272.042,
+    "max_ms": 272.042,
+    "individual_ms": [
+      219.885,
+      230.192,
+      255.247,
+      263.792,
+      272.042,
+      269.071,
+      252.565,
+      256.423,
+      258.823,
+      267.947
+    ],
+    "definition": "Launch request to all repository listing pages received. Remote runs include SSH process-launch overhead; filesystem caches remain warm."
+  },
+  "idle_before": {
+    "seconds": 60.271,
+    "cpu_ticks": 0,
+    "cpu_percent_of_one_core": 0.0,
+    "cpu_resolution_percent": 0.01659,
+    "rss_kib": 2792,
+    "status_vm_rss_kib": 2792,
+    "status_vm_hwm_kib": 2792,
+    "threads": 1
+  },
+  "workload_seconds": 2.558,
+  "latency": {
+    "repositories": {
+      "count": 50,
+      "p50_ms": 9.565,
+      "p95_ms": 11.558,
+      "max_ms": 13.496,
+      "min_response_bytes": 21885,
+      "max_response_bytes": 21885
+    },
+    "checkout_directory": {
+      "count": 50,
+      "p50_ms": 6.772,
+      "p95_ms": 9.218,
+      "max_ms": 17.51,
+      "min_response_bytes": 3340,
+      "max_response_bytes": 3340
+    },
+    "committed_directory": {
+      "count": 50,
+      "p50_ms": 3.585,
+      "p95_ms": 5.607,
+      "max_ms": 12.949,
+      "min_response_bytes": 1894,
+      "max_response_bytes": 1894
+    },
+    "source_3564_bytes": {
+      "count": 50,
+      "p50_ms": 8.453,
+      "p95_ms": 10.844,
+      "max_ms": 12.353,
+      "min_response_bytes": 16909,
+      "max_response_bytes": 16909
+    },
+    "markdown": {
+      "count": 50,
+      "p50_ms": 6.849,
+      "p95_ms": 9.905,
+      "max_ms": 10.799,
+      "min_response_bytes": 2060,
+      "max_response_bytes": 2060
+    },
+    "history_50": {
+      "count": 50,
+      "p50_ms": 3.457,
+      "p95_ms": 5.976,
+      "max_ms": 7.349,
+      "min_response_bytes": 11196,
+      "max_response_bytes": 11196
+    },
+    "working_changes": {
+      "count": 50,
+      "p50_ms": 6.129,
+      "p95_ms": 8.702,
+      "max_ms": 8.856,
+      "min_response_bytes": 3231,
+      "max_response_bytes": 3231
+    },
+    "snapshot_diff": {
+      "count": 50,
+      "p50_ms": 3.811,
+      "p95_ms": 6.407,
+      "max_ms": 7.947,
+      "min_response_bytes": 2216,
+      "max_response_bytes": 2216
+    },
+    "source_65536_bytes": {
+      "count": 50,
+      "p50_ms": 76.878,
+      "p95_ms": 91.434,
+      "max_ms": 101.115,
+      "min_response_bytes": 1550191,
+      "max_response_bytes": 1550191
+    },
+    "large_repository_readme": {
+      "count": 50,
+      "p50_ms": 16.839,
+      "p95_ms": 39.068,
+      "max_ms": 45.281,
+      "min_response_bytes": 1629,
+      "max_response_bytes": 1629
+    }
+  },
+  "source_rendering": {
+    "source_3564_bytes": {
+      "responses_with_highlighting": 50,
+      "plain_fallback_responses": 0,
+      "min_highlighted_spans": 155,
+      "max_highlighted_spans": 155
+    },
+    "source_65536_bytes": {
+      "responses_with_highlighting": 50,
+      "plain_fallback_responses": 0,
+      "min_highlighted_spans": 30280,
+      "max_highlighted_spans": 30280
+    }
+  },
+  "aggregate_latency": {
+    "count": 500,
+    "p50_ms": 6.697,
+    "p95_ms": 76.873,
+    "max_ms": 101.115
+  },
+  "errors": [],
+  "memory": {
+    "sampled_peak_rss_kib": 15052,
+    "process_vm_hwm_kib": 16968,
+    "samples": 56,
+    "sampling_interval_seconds": 0.05,
+    "sampling_errors": [],
+    "method": "smaps_rollup RSS sampled at ~50 ms; VmHWM captures process high-water RSS including mappings. SSH sampling uses one persistent shell stream."
+  },
+  "idle_after": {
+    "seconds": 60.225,
+    "cpu_ticks": 0,
+    "cpu_percent_of_one_core": 0.0,
+    "cpu_resolution_percent": 0.0166,
+    "rss_kib": 13056,
+    "status_vm_rss_kib": 13056,
+    "status_vm_hwm_kib": 16968,
+    "threads": 1
+  },
+  "target_checks": {
+    "reference_workload_complete": true,
+    "binary_at_most_20_mib": true,
+    "idle_rss_at_most_16_mib": true,
+    "browsing_rss_at_most_64_mib": true,
+    "every_endpoint_p95_at_most_200_ms": true,
+    "startup_at_most_1_second": true,
+    "idle_cpu_below_0_1_percent": true,
+    "idle_observation_at_least_60_seconds": true
+  },
+  "limits": "Observed workload results, not universal hard RSS or execution-time guarantees; no native ARM hardware performance measurement."
+}

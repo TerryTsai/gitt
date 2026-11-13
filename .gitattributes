@@ -1,0 +1,4 @@
+# Preserve the whitespace in upstream grammar and license snapshots.
+assets/syntaxes/** -whitespace
+assets/licenses/** -whitespace
+THIRD_PARTY_NOTICES.md -whitespace

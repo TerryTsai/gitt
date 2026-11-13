@@ -1,0 +1,23 @@
+[Unit]
+Description=gitt Git repository browser
+After=network.target
+RequiresMountsFor=/srv/git
+
+[Service]
+Type=simple
+User=gitt
+Group=git
+ExecStart=/usr/local/bin/gitt /srv/git --bind 127.0.0.1:8080 --origin http://127.0.0.1:8080
+Restart=on-failure
+RestartSec=5
+UMask=0007
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/git
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,37 @@
+[package]
+name = "gitt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A small, standalone Git browser for your own repositories"
+license = "MIT"
+
+[dependencies]
+ammonia = "4"
+askama = { version = "0.16.1", default-features = false, features = ["derive", "std"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.22"
+git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
+libz-sys = { version = "1", default-features = false, features = ["static", "libc"] }
+libgit2-sys = { version = "0.18.8", default-features = false }
+onig_sys = { version = "69.9.3", default-features = false }
+hmac = "0.12"
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+libc = "0.2"
+percent-encoding = "2"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+sha2 = "0.10"
+syntect = { version = "5.3", default-features = false, features = ["parsing", "html", "dump-load", "regex-onig"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "io-util", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+[build-dependencies]
+syntect = { version = "5.3", default-features = false, features = ["parsing", "yaml-load", "dump-create", "regex-onig"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

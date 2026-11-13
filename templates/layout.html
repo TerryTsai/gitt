@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{{ title }} · gitt</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+<nav aria-label="Site">
+<a href="/"><strong>gitt</strong></a>
+<a href="/">Repositories</a>
+<a href="/new">Create repository</a>
+</nav>
+{% if !repo_name.is_empty() %}
+<p><code>{{ repo_name }}</code></p>
+<nav aria-label="Repository">
+{% for tab in tabs %}<a href="{{ tab.href }}">{{ tab.label }}</a>{% endfor %}
+<a href="">Refresh</a>
+</nav>
+{% endif %}
+</header>
+<main>
+<h1>{{ title }}</h1>
+{{ body|safe }}
+</main>
+<footer>
+<p>gitt · <a href="/help">Help and limits</a></p>
+</footer>
+</body>
+</html>
