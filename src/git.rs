@@ -1,21 +1,21 @@
 //! Read-only Git views. Every URL keeps the original filename bytes.
 mod fs;
+mod metadata;
 
 use crate::render::{display, escape, file_content_with_context, url};
 use crate::security::Root;
 use crate::types::{AppError, HTML_LIMIT, Page, Params, RAW_LIMIT, Result, TEXT_LIMIT};
-use git2::{Index, ObjectType, Oid, Repository, RepositoryOpenFlags, Tree};
-use std::collections::{BTreeMap, BTreeSet};
+use git2::{ObjectType, Oid, Repository, RepositoryOpenFlags, Tree};
+#[cfg(test)]
 use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::fs::File;
+#[cfg(test)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 const PATH_LIMIT: usize = 10_000;
 const PAGE_SIZE: usize = 200;
 const HISTORY_SIZE: usize = 50;
-const LINE_LIMIT: usize = 20_000;
 const SSH_PATH: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
     .remove(b'/')
     .remove(b'-')
@@ -23,17 +23,12 @@ const SSH_PATH: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERI
     .remove(b'.')
     .remove(b'~');
 
-pub enum Raw {
-    Bytes(Vec<u8>),
-    File(File),
-}
-
 struct Repo {
     git: Repository,
     relative: Vec<u8>,
-    gitdir: Vec<u8>,
 }
 
+#[cfg(test)]
 fn path(bytes: &[u8]) -> &Path {
     Path::new(OsStr::from_bytes(bytes))
 }
@@ -128,13 +123,7 @@ fn repository(root: &Root, relative: &[u8]) -> Result<Repo> {
             Err(e) => return Err(e),
         }
     }
-    for name in [
-        b"HEAD".as_slice(),
-        b"config",
-        b"packed-refs",
-        b"index",
-        b"shallow",
-    ] {
+    for name in [b"HEAD".as_slice(), b"config", b"packed-refs", b"shallow"] {
         let full = fs::join(&gitdir, name);
         match fs::stat(root, &full) {
             Ok(st) if !fs::is_file(&st) => {
@@ -173,13 +162,6 @@ fn repository(root: &Root, relative: &[u8]) -> Result<Repo> {
         ));
     }
     let config = git.config()?;
-    if config.get_bool("core.sparsecheckout").unwrap_or(false)
-        || config.get_bool("core.splitindex").unwrap_or(false)
-    {
-        return Err(AppError::limit(
-            "Sparse checkouts and split indexes are not supported.",
-        ));
-    }
     if config
         .get_string("extensions.objectformat")
         .is_ok_and(|v| v != "sha1")
@@ -194,26 +176,7 @@ fn repository(root: &Root, relative: &[u8]) -> Result<Repo> {
     Ok(Repo {
         git,
         relative: relative.to_vec(),
-        gitdir,
     })
-}
-
-fn index(repo: &Repo) -> Result<Index> {
-    let index = repo.git.index().map_err(|_| AppError::limit("The Git index could not be read. Split or sparse indexes and corrupt index files are not supported; inspect this checkout with local Git."))?;
-    if index.len() > 100_000 {
-        return Err(AppError::limit(
-            "This index exceeds the 100,000 entry limit.",
-        ));
-    }
-    if index
-        .iter()
-        .any(|e| e.mode == 0o040000 || e.flags_extended & 0x4000 != 0)
-    {
-        return Err(AppError::limit(
-            "Sparse indexes and skip-worktree entries are not supported.",
-        ));
-    }
-    Ok(index)
 }
 
 fn object_size(repo: &Repository, id: Oid, limit: usize) -> Result<ObjectType> {
@@ -234,21 +197,37 @@ fn blob(repo: &Repository, id: Oid, limit: usize) -> Result<Vec<u8>> {
 }
 fn commit<'a>(repo: &'a Repository, revision: &[u8]) -> Result<git2::Commit<'a>> {
     let revision = if revision.is_empty() {
-        "HEAD"
+        b"HEAD"
     } else {
-        std::str::from_utf8(revision)
-            .map_err(|_| AppError::bad("Use an object ID for non-UTF-8 references."))?
+        revision
     };
-    if revision.len() > 1024 || revision.as_bytes().contains(&0) {
+    if revision.len() > 1024 || revision.contains(&0) {
         return Err(AppError::bad("Invalid revision."));
     }
-    let mut id = if revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Oid::from_str(revision)?
-    } else {
-        repo.resolve_reference_from_short_name(revision)?
+    let mut id = if revision.len() == 40 && revision.iter().all(u8::is_ascii_hexdigit) {
+        Oid::from_str(std::str::from_utf8(revision).expect("hex object ID"))?
+    } else if let Ok(name) = std::str::from_utf8(revision) {
+        repo.resolve_reference_from_short_name(name)?
             .resolve()?
             .target()
             .ok_or_else(|| AppError::limit("This reference has no object target."))?
+    } else {
+        // Ref names are bytes. A bounded scan also preserves non-UTF-8 names
+        // without replacing a selected branch or tag with its object ID.
+        let mut target = None;
+        for (index, reference) in repo.references()?.enumerate() {
+            if index >= PATH_LIMIT {
+                return Err(AppError::limit(
+                    "Reference lookup exceeds the 10,000 reference limit.",
+                ));
+            }
+            let reference = reference?;
+            if reference.name_bytes() == revision {
+                target = reference.resolve()?.target();
+                break;
+            }
+        }
+        target.ok_or_else(|| AppError::new(404, "Reference not found."))?
     };
     for _ in 0..16 {
         match object_size(repo, id, RAW_LIMIT)? {
@@ -306,49 +285,49 @@ fn tree_entry(
     Err(AppError::new(404, "File not found."))
 }
 
-fn header(repo: &Repo, q: &Params, ssh_prefix: Option<&str>) -> String {
-    let r = repo.relative.as_slice();
-    let mut body = String::from("<p><small>");
-    body.push_str(if repo.git.is_bare() {
-        "Bare repository"
+fn selection(repo: &Repository, revision: &[u8]) -> Result<Vec<u8>> {
+    if !revision.is_empty() {
+        return Ok(revision.to_vec());
+    }
+    let head = repo.find_reference("HEAD")?;
+    if let Some(name) = head.symbolic_target_bytes() {
+        Ok(name.to_vec())
     } else {
-        "Working checkout"
-    });
-    if let Ok(head) = repo.git.head() {
-        body.push_str(" · HEAD: ");
-        body.push_str(&label(head.shorthand_bytes()));
-        if repo.git.head_detached().unwrap_or(false) {
-            body.push_str(" (detached HEAD)");
+        head.target()
+            .map(|id| id.to_string().into_bytes())
+            .ok_or_else(|| AppError::limit("HEAD has no commit target."))
+    }
+}
+
+fn selected_commit<'a>(repo: &'a Repository, revision: &[u8]) -> Result<Option<git2::Commit<'a>>> {
+    match commit(repo, revision) {
+        Ok(commit) => Ok(Some(commit)),
+        Err(_)
+            if repo
+                .head()
+                .is_err_and(|e| e.code() == git2::ErrorCode::UnbornBranch)
+                && (revision == b"HEAD" || revision == selection(repo, b"")?) =>
+        {
+            Ok(None)
         }
-    } else {
-        body.push_str(" · No commits yet");
+        Err(error) => Err(error),
     }
-    if repo.git.is_shallow() {
-        body.push_str(" · Shallow history: only locally available commits are shown");
-    }
-    body.push_str("</small></p>");
-    if let Some(prefix) = ssh_prefix {
-        // SSH URI paths preserve arbitrary bytes by percent encoding; scp-like prefixes are displayed literally.
-        let suffix = if prefix.starts_with("ssh://") {
-            percent_encoding::percent_encode(r, SSH_PATH).to_string()
-        } else {
-            display(r)
-        };
-        let _ = write!(
-            body,
-            "<details><summary>SSH clone URL</summary><pre><code>{}{}</code></pre></details>",
-            escape(prefix),
-            escape(&suffix)
-        );
-    }
-    let _ = q;
-    body
+}
+
+fn revision_link(route: &str, q: &Params, revision: &[u8], text: &str) -> String {
+    let mut selected = q.clone();
+    selected.0.insert("rev".into(), revision.to_vec());
+    let args: Vec<_> = selected
+        .0
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_slice()))
+        .collect();
+    a(route, &args, text)
 }
 
 #[derive(Clone)]
 struct Found {
     relative: Vec<u8>,
-    kind: &'static str,
 }
 
 fn discover(root: &Root) -> Result<(Vec<Found>, bool)> {
@@ -367,14 +346,9 @@ fn discover(root: &Root) -> Result<(Vec<Found>, bool)> {
             continue;
         }
         let dotgit = fs::join(&directory, b".git");
-        if let Ok(st) = fs::stat(root, &dotgit) {
+        if fs::stat(root, &dotgit).is_ok() {
             found.push(Found {
                 relative: directory,
-                kind: if fs::is_dir(&st) {
-                    "checkout"
-                } else {
-                    "unsupported linked checkout"
-                },
             });
             continue;
         }
@@ -383,7 +357,6 @@ fn discover(root: &Root) -> Result<(Vec<Found>, bool)> {
         {
             found.push(Found {
                 relative: directory,
-                kind: "bare",
             });
             continue;
         }
@@ -414,256 +387,340 @@ fn discover(root: &Root) -> Result<(Vec<Found>, bool)> {
     Ok((found, incomplete))
 }
 
+fn repository_metadata(
+    root: &Root,
+    relative: &[u8],
+    revision: &[u8],
+) -> Result<(Vec<u8>, Option<metadata::LastChange>)> {
+    let repo = repository(root, relative)?;
+    let selected = selection(&repo.git, revision)?;
+    let Some(snapshot) = selected_commit(&repo.git, &selected)? else {
+        return Ok((selected, None));
+    };
+    let id = snapshot.id();
+    // Only inspect the visible repository's selected commit, without walking history
+    // or scanning its worktree. Keep oversized/missing metadata local to its row.
+    object_size(&repo.git, id, TEXT_LIMIT)?;
+    let commit = repo.git.find_commit(id)?;
+    let change = metadata::LastChange {
+        commit: id,
+        timestamp: commit.time().seconds(),
+        author: metadata::short_text(commit.author().name_bytes(), 128),
+        message: metadata::short_text(
+            commit
+                .message_bytes()
+                .split(|byte| *byte == b'\n')
+                .next()
+                .unwrap_or(b""),
+            512,
+        ),
+    };
+    Ok((selected, Some(change)))
+}
+
 fn repositories(root: &Root, q: &Params) -> Result<Page> {
     let (found, incomplete) = discover(root)?;
+    repository_list(root, q, &found, incomplete, "/")
+}
+
+fn repository_list(
+    root: &Root,
+    q: &Params,
+    found: &[Found],
+    incomplete: bool,
+    route: &str,
+) -> Result<Page> {
     let filter = q.text("q")?.to_lowercase();
     let found: Vec<_> = found
         .iter()
         .filter(|r| display(&r.relative).to_lowercase().contains(&filter))
         .collect();
     let current = q.page()?;
-    let mut body = format!(
-        "<form role=\"search\" method=\"get\" action=\"/\"><label>Repository name <input type=\"search\" name=\"q\" value=\"{}\"></label><button type=\"submit\">Find</button></form><p>{} · {}</p>",
-        label(q.bytes("q")),
-        a("/new", &[], "Create repository"),
-        a("/", &[("q", q.bytes("q"))], "Refresh")
-    );
+    let mut body = String::new();
     if incomplete {
         body.push_str("<p><strong>Incomplete scan.</strong> Discovery stops after 10,000 directories, 1,000 repositories, or an unreadable directory. Narrow the watched root to see everything.</p>");
     }
     if found.is_empty() {
         body.push_str("<p>No repositories found.</p>");
     } else {
-        body.push_str("<ul>");
+        body.push_str("<div role=\"region\" aria-label=\"Repository list\" tabindex=\"0\"><table aria-label=\"Projects\"><thead><tr><th scope=\"col\">Name</th><th scope=\"col\">Last commit</th><th scope=\"col\">Author</th><th scope=\"col\">Age</th><th scope=\"col\">Revision</th></tr></thead><tbody>");
         for item in found.iter().skip(current * PAGE_SIZE).take(PAGE_SIZE) {
             let name = if item.relative.is_empty() {
                 ".".to_owned()
             } else {
                 display(&item.relative)
             };
-            let _ = write!(
-                body,
-                "<li>{} <small>{}</small></li>",
-                a("/files", &[("repo", &item.relative)], &name),
-                item.kind
-            );
+            let selected = q.0.contains_key("repo") && q.bytes("repo") == item.relative;
+            let revision = if selected { q.bytes("rev") } else { b"" };
+            let mut args = vec![("repo", item.relative.as_slice())];
+            if !revision.is_empty() {
+                args.push(("rev", revision));
+            }
+            let mut row = q.clone();
+            row.0.insert("repo".into(), item.relative.clone());
+            let _ = write!(body, "<tr><td>{}</td>", a("/files", &args, &name));
+            match repository_metadata(root, &item.relative, revision) {
+                Ok((selected, change)) => {
+                    if let Some(change) = change {
+                        let stamp = date(change.timestamp);
+                        let iso = stamp.trim_end_matches(" UTC").replacen(' ', "T", 1) + "Z";
+                        let _ = write!(
+                            body,
+                            "<td>{}</td><td>{}</td><td><time datetime=\"{}\" title=\"{}\">{}</time></td>",
+                            revision_link(
+                                route,
+                                &row,
+                                change.commit.to_string().as_bytes(),
+                                &change.message
+                            ),
+                            escape(&change.author),
+                            escape(&iso),
+                            escape(&stamp),
+                            age(change.timestamp)
+                        );
+                    } else {
+                        body.push_str("<td>—</td><td>—</td><td>—</td>");
+                    }
+                    let _ = write!(
+                        body,
+                        "<td>{}</td>",
+                        revision_link(
+                            route,
+                            &row,
+                            &selected,
+                            &crate::render::revision_text(&selected)
+                        )
+                    );
+                }
+                Err(_) => body.push_str("<td>—</td><td>—</td><td>—</td><td>—</td>"),
+            }
+            body.push_str("</tr>");
         }
-        body.push_str("</ul>");
+        body.push_str("</tbody></table></div>");
     }
     pagination(
         &mut body,
-        "/",
+        route,
         q,
         current,
         found.len() > (current + 1) * PAGE_SIZE,
     );
-    finish("Repositories", body)
+    let mut page = finish("Repositories", body)?;
+    page.show_heading = false;
+    page.show_create = true;
+    Ok(page)
 }
 
-fn tracked(index: &Index, relative: &[u8]) -> bool {
-    if (0..=3).any(|stage| index.get_path(path(relative), stage).is_some()) {
-        return true;
+fn search_scope(repo: &[u8]) -> String {
+    let mut scope = String::from("repo:");
+    for byte in repo {
+        let _ = write!(scope, "{byte:02x}");
     }
-    let mut directory = relative.to_vec();
-    directory.push(b'/');
-    index.find_prefix(directory).is_ok()
-}
-fn working_path(root: &Root, repo: &Repo, index: &Index, relative: &[u8]) -> Result<Vec<u8>> {
-    fs::valid(relative)?;
-    if !relative.is_empty()
-        && !tracked(index, relative)
-        && repo.git.is_path_ignored(path(relative))?
-    {
-        return Err(AppError::new(404, "Ignored files are not exposed by gitt."));
-    }
-    let mut ancestor = Vec::new();
-    for segment in relative.split(|b| *b == b'/').filter(|p| !p.is_empty()) {
-        ancestor = fs::join(&ancestor, segment);
-        if index
-            .get_path(path(&ancestor), 0)
-            .is_some_and(|e| e.mode == 0o160000)
-        {
-            return Err(AppError::limit(
-                "Submodule contents are not browsed. Use the recorded commit with local Git.",
-            ));
-        }
-        if fs::stat(
-            root,
-            &fs::join(&fs::join(&repo.relative, &ancestor), b".git"),
-        )
-        .is_ok()
-        {
-            return Err(AppError::limit(
-                "Nested repositories and linked worktrees are not browsed through a parent checkout.",
-            ));
-        }
-    }
-    Ok(fs::join(&repo.relative, relative))
+    scope
 }
 
-fn file_heading(repo: &[u8], relative: &[u8], revision: &[u8]) -> String {
-    let mut heading = a(
-        "/files",
-        &[("repo", repo), ("rev", revision)],
-        &if repo.is_empty() {
-            ".".into()
-        } else {
-            display(repo)
-        },
-    );
-    let mut prefix = Vec::new();
-    for segment in relative.split(|b| *b == b'/').filter(|s| !s.is_empty()) {
-        prefix = fs::join(&prefix, segment);
-        heading.push_str(" / ");
-        if prefix == relative {
-            heading.push_str(&label(segment));
-        } else {
-            heading.push_str(&a(
-                "/files",
-                &[("repo", repo), ("path", &prefix), ("rev", revision)],
-                &display(segment),
-            ));
-        }
-    }
-    heading
-}
-
-fn file_context(
-    repo: &Repo,
-    q: &Params,
-    ssh: Option<&str>,
-    working: bool,
-    revision: &[u8],
-    actions: &str,
-) -> String {
-    let mut body = String::from("<aside aria-label=\"File context\"><details><summary>");
-    if working {
-        body.push_str("Working tree · ");
-        if let Ok(head) = repo.git.head() {
-            if repo.git.head_detached().unwrap_or(false) {
-                body.push_str("detached HEAD");
-            } else {
-                body.push_str(&label(head.shorthand_bytes()));
+// Normalize native search form submissions once, so every result link can
+// change only rev without carrying stale form state for a previous repository.
+pub fn search_params(q: &Params) -> Result<Params> {
+    let mut result = q.clone();
+    if q.0.contains_key("scope") {
+        if q.bytes("scope") == b"repositories" {
+            if !q.0.contains_key("repo") {
+                result.0.remove("scope");
+                result.0.remove("rev");
             }
         } else {
-            body.push_str("no commits");
+            let repo = search_repository(q)?.expect("repository scope");
+            if q.bytes("snapshot_scope") != search_scope(&repo).as_bytes() {
+                result.0.remove("rev");
+            }
+            result.0.insert("repo".into(), repo);
+            result.0.remove("scope");
         }
-    } else {
-        body.push_str("Snapshot · ");
-        body.push_str(&label(&revision[..revision.len().min(12)]));
+        result.0.remove("snapshot_scope");
     }
-    body.push_str("</summary>");
-    body.push_str(&header(repo, q, ssh));
-    if working {
-        body.push_str("<p>Current files on disk. Ignored untracked files are hidden.</p>");
-    } else {
-        let _ = write!(body, "<p>Commit <code>{}</code></p>", label(revision));
-        if !repo.git.is_bare() {
-            let _ = write!(
-                body,
-                "<p>{}</p>",
-                a(
-                    "/files",
-                    &[("repo", &repo.relative)],
-                    "Browse current working tree"
+    Ok(result)
+}
+
+fn search_repository(q: &Params) -> Result<Option<Vec<u8>>> {
+    let selected = if q.0.contains_key("scope") {
+        match q.text("scope")? {
+            "repositories" => None,
+            scope => {
+                let encoded = scope
+                    .strip_prefix("repo:")
+                    .ok_or_else(|| AppError::bad("Invalid search scope."))?;
+                if !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(AppError::bad("Invalid search scope."));
+                }
+                Some(
+                    Params::parse(&format!("repo_hex={encoded}"))?
+                        .bytes("repo")
+                        .to_vec(),
                 )
-            );
+            }
         }
+    } else {
+        q.0.get("repo").cloned()
+    };
+    Ok(selected)
+}
+
+fn search(root: &Root, q: &Params) -> Result<Page> {
+    let selected = search_repository(q)?;
+    let (found, incomplete) = discover(root)?;
+    let scope = selected
+        .as_deref()
+        .map(search_scope)
+        .unwrap_or_else(|| "repositories".into());
+    let query = q.text("q")?;
+    let mut params = q.clone();
+    // Keep a selected snapshot across searches, but use HEAD when the user
+    // switches repositories in the same form. A commit belongs to its scope.
+    let mut revision =
+        if !q.0.contains_key("scope") || q.bytes("snapshot_scope") == scope.as_bytes() {
+            q.bytes("rev").to_vec()
+        } else {
+            Vec::new()
+        };
+    let mut results = String::new();
+    if let Some(relative) = &selected {
+        let repo = repository(root, relative)?;
+        revision = selection(&repo.git, &revision)?;
+        if q.0.contains_key("q") {
+            params.0.insert("repo".into(), relative.clone());
+            params.0.insert("rev".into(), revision.clone());
+            let page = files(&repo, &params, None, "/search")?;
+            revision = page.revision.unwrap_or_default();
+            results = page.body;
+        }
+    } else if q.0.contains_key("q") {
+        params.0.insert("scope".into(), b"repositories".to_vec());
+        results = repository_list(root, &params, &found, incomplete, "/search")?.body;
     }
-    body.push_str("</details>");
-    if !actions.is_empty() {
-        let _ = write!(body, "<nav aria-label=\"File actions\">{actions}</nav>");
+    let mut body = String::from(
+        "<form role=\"search\" method=\"get\" action=\"/search\"><label>Search in<select aria-label=\"Search in\" name=\"scope\">",
+    );
+    let _ = write!(
+        body,
+        "<option value=\"repositories\"{}>Repository names</option>",
+        if selected.is_none() { " selected" } else { "" }
+    );
+    let option = |relative: &[u8]| {
+        format!(
+            "<option value=\"{}\"{}>{}</option>",
+            search_scope(relative),
+            if selected.as_deref() == Some(relative) {
+                " selected"
+            } else {
+                ""
+            },
+            if relative.is_empty() {
+                ".".into()
+            } else {
+                escape(&display(relative))
+            }
+        )
+    };
+    for item in &found {
+        body.push_str(&option(&item.relative));
     }
-    body.push_str("</aside>");
-    body
+    if let Some(relative) = &selected
+        && !found.iter().any(|item| item.relative == *relative)
+    {
+        body.push_str(&option(relative));
+    }
+    body.push_str("</select></label>");
+    if selected.is_some() && !revision.is_empty() {
+        body.push_str(&hidden("rev", &revision));
+        body.push_str(&hidden("snapshot_scope", scope.as_bytes()));
+    }
+    let _ = write!(
+        body,
+        "<input aria-label=\"Search query\" placeholder=\"Name or file path\" type=\"search\" name=\"q\" value=\"{}\" autofocus><button type=\"submit\">Search</button></form>",
+        escape(query)
+    );
+    if incomplete && (selected.is_some() || !q.0.contains_key("q")) {
+        body.push_str("<p>The repository list is incomplete. Narrow the watched root to see all repositories.</p>");
+    }
+    body.push_str(&results);
+    let mut page = finish("Search", body)?;
+    page.show_heading = false;
+    Ok(page)
+}
+
+fn clone_url(repo: &Repo, ssh: Option<&str>) -> String {
+    let Some(prefix) = ssh else {
+        return String::new();
+    };
+    let suffix = percent_encoding::percent_encode(&repo.relative, SSH_PATH).to_string();
+    format!(
+        "<p aria-label=\"SSH clone URL\"><code>{}{}</code></p>",
+        escape(prefix),
+        escape(&suffix)
+    )
 }
 
 struct FileEntry {
     path: Vec<u8>,
     directory: bool,
-    note: String,
+    mode: u32,
+    object: Option<Oid>,
 }
 
-fn list_working(
-    root: &Root,
-    repo: &Repo,
-    index: &Index,
-    head: Option<&Tree<'_>>,
-    relative: &[u8],
-    query: &str,
-) -> Result<(Vec<FileEntry>, bool)> {
-    let mut result = Vec::new();
-    let mut pending = vec![relative.to_vec()];
-    let mut scanned = 0;
-    let mut incomplete = false;
-    while let Some(directory) = pending.pop() {
-        let full = working_path(root, repo, index, &directory)?;
-        let listing = fs::entries(&root.open(&full, true)?, PATH_LIMIT)?;
-        incomplete |= listing.incomplete;
-        for name in listing.names {
-            if name == b".git" {
-                continue;
-            }
-            scanned += 1;
-            if scanned > PATH_LIMIT {
-                incomplete = true;
-                break;
-            }
-            let relative = fs::join(&directory, &name);
-            if !tracked(index, &relative) && repo.git.is_path_ignored(path(&relative))? {
-                continue;
-            }
-            let st = match fs::stat(root, &fs::join(&repo.relative, &relative)) {
-                Ok(s) => s,
-                Err(_) => {
-                    incomplete = true;
-                    continue;
-                }
-            };
-            let directory = fs::is_dir(&st);
-            let submodule = index
-                .get_path(path(&relative), 0)
-                .is_some_and(|e| e.mode == 0o160000);
-            let nested = directory
-                && fs::stat(
-                    root,
-                    &fs::join(&fs::join(&repo.relative, &relative), b".git"),
-                )
-                .is_ok();
-            if !query.is_empty() && directory && !submodule && !nested {
-                pending.push(relative.clone());
-            }
-            if !query.is_empty() && !display(&relative).to_lowercase().contains(query) {
-                continue;
-            }
-            let note = if submodule {
-                "submodule (contents unsupported)".into()
-            } else if nested {
-                "nested repository (contents unsupported)".into()
-            } else if directory {
-                "directory".into()
-            } else if fs::is_link(&st) {
-                format!(
-                    "symbolic link · {}",
-                    file_status(root, repo, index, head, &relative, &st)?
-                )
-            } else if !fs::is_file(&st) {
-                "special file (not readable)".into()
-            } else {
-                file_status(root, repo, index, head, &relative, &st)?
-            };
-            result.push(FileEntry {
-                path: relative,
-                directory,
-                note,
-            });
-        }
-        if scanned > PATH_LIMIT {
-            break;
-        }
+fn mode_label(mode: u32) -> String {
+    match mode {
+        0 => "absent".into(),
+        0o040000 => "-".into(),
+        0o120000 => "symlink".into(),
+        0o160000 => "submodule".into(),
+        _ => [6, 3, 0]
+            .map(|shift| {
+                [(4, 'r'), (2, 'w'), (1, 'x')]
+                    .map(|(bit, letter)| {
+                        if mode >> shift & bit != 0 {
+                            letter
+                        } else {
+                            '-'
+                        }
+                    })
+                    .iter()
+                    .collect::<String>()
+            })
+            .join(" "),
     }
-    result.sort_by(|a, b| b.directory.cmp(&a.directory).then(a.path.cmp(&b.path)));
-    Ok((result, incomplete))
+}
+
+fn size_label(size: Option<u64>) -> String {
+    match size {
+        None => "—".into(),
+        Some(n) if n < 1024 => format!("{n} B"),
+        Some(n) if n < 10 * 1024 => format!("{:.1}K", n as f64 / 1024.0),
+        Some(n) if n < 1024 * 1024 => format!("{:.0}K", n as f64 / 1024.0),
+        Some(n) if n < 1024 * 1024 * 1024 => format!("{:.1}M", n as f64 / (1024.0 * 1024.0)),
+        Some(n) => format!("{:.1}G", n as f64 / (1024.0 * 1024.0 * 1024.0)),
+    }
+}
+
+fn age(seconds: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let elapsed = now.saturating_sub(seconds).max(0);
+    if elapsed < 3600 {
+        format!("{}m", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{}h", elapsed / 3600)
+    } else if elapsed < 14 * 86_400 {
+        format!("{}d", elapsed / 86_400)
+    } else if elapsed < 60 * 86_400 {
+        format!("{}w", elapsed / (7 * 86_400))
+    } else if elapsed < 730 * 86_400 {
+        format!("{}mo", elapsed / (30 * 86_400))
+    } else {
+        format!("{}y", elapsed / (365 * 86_400))
+    }
 }
 
 fn list_tree(
@@ -693,17 +750,15 @@ fn list_tree(
             if !query.is_empty() && !display(&full).to_lowercase().contains(query) {
                 continue;
             }
-            let note = match entry.filemode() {
-                0o040000 => "directory",
-                0o120000 => "symbolic link",
-                0o160000 => "submodule (contents unsupported)",
-                0o100755 => "executable",
-                _ => "file",
-            };
             result.push(FileEntry {
                 path: full,
                 directory: is_directory,
-                note: note.to_owned(),
+                mode: entry.filemode() as u32,
+                object: if entry.kind() == Some(ObjectType::Blob) {
+                    Some(entry.id())
+                } else {
+                    None
+                },
             });
         }
         if scanned > PATH_LIMIT {
@@ -717,20 +772,14 @@ fn list_tree(
 fn directory_html(
     body: &mut String,
     repo: &Repo,
-    q: &Params,
+    navigation: (&str, &Params),
     revision: &[u8],
     entries: Vec<FileEntry>,
     incomplete: bool,
+    tip: Oid,
 ) -> Result<()> {
+    let (route, q) = navigation;
     let relative = q.bytes("path");
-    let _ = write!(
-        body,
-        "<form role=\"search\" method=\"get\" action=\"/files\">{}{}{}<label>Find a path <input type=\"search\" name=\"q\" value=\"{}\"></label><button type=\"submit\">Find</button></form>",
-        hidden("repo", &repo.relative),
-        hidden("path", relative),
-        hidden("rev", revision),
-        escape(q.text("q")?)
-    );
     if incomplete {
         body.push_str("<p><strong>Incomplete listing:</strong> the 10,000 path limit was reached or a path became unreadable.</p>");
     }
@@ -738,8 +787,16 @@ fn directory_html(
         body.push_str("<p>No matching files.</p>");
     }
     let current = q.page()?;
-    body.push_str("<ul>");
-    for entry in entries.iter().skip(current * PAGE_SIZE).take(PAGE_SIZE) {
+    let visible: Vec<_> = entries
+        .iter()
+        .skip(current * PAGE_SIZE)
+        .take(PAGE_SIZE)
+        .collect();
+    let paths: Vec<_> = visible.iter().map(|entry| entry.path.clone()).collect();
+    let changes = metadata::last_changes(&repo.git, tip, &paths)?;
+    let mut size_unavailable = false;
+    body.push_str("<div role=\"region\" aria-label=\"File list\" tabindex=\"0\"><table aria-label=\"Files\"><thead><tr><th scope=\"col\">Name</th><th scope=\"col\">Last commit</th><th scope=\"col\">Author</th><th scope=\"col\">Size</th><th scope=\"col\">Age</th><th scope=\"col\">Mode</th></tr></thead><tbody>");
+    for entry in visible {
         let name = entry
             .path
             .strip_prefix(relative)
@@ -750,113 +807,137 @@ fn directory_html(
         if entry.directory {
             text.push('/');
         }
+        let href = url(
+            "/files",
+            &[
+                ("repo", &repo.relative),
+                ("path", &entry.path),
+                ("rev", revision),
+            ],
+        );
+        let change = changes.entries.get(&entry.path);
+        let mut size = None;
+        if let Some(id) = entry.object {
+            match repo.git.odb()?.read_header(id) {
+                Ok((n, ObjectType::Blob)) => size = Some(n as u64),
+                _ => size_unavailable = true,
+            }
+        }
         let _ = write!(
             body,
-            "<li>{} <small>{}</small></li>",
-            a(
-                "/files",
-                &[
-                    ("repo", &repo.relative),
-                    ("path", &entry.path),
-                    ("rev", revision)
-                ],
-                &text
-            ),
-            escape(&entry.note)
+            "<tr><td><a href=\"{}\"><span>{}</span></a></td>",
+            escape(&href),
+            escape(&text)
         );
+        if let Some(m) = change {
+            let stamp = date(m.timestamp);
+            let iso = stamp.trim_end_matches(" UTC").replacen(' ', "T", 1) + "Z";
+            let _ = write!(
+                body,
+                "<td>{}</td><td>{}</td><td>{}</td><td><time datetime=\"{}\" title=\"{}\">{}</time></td>",
+                revision_link(route, q, m.commit.to_string().as_bytes(), &m.message),
+                escape(&m.author),
+                size_label(size),
+                escape(&iso),
+                escape(&stamp),
+                age(m.timestamp)
+            );
+        } else {
+            let _ = write!(
+                body,
+                "<td>—</td><td>—</td><td>{}</td><td>—</td>",
+                size_label(size)
+            );
+        }
+        let _ = write!(body, "<td>{}</td></tr>", mode_label(entry.mode));
     }
-    body.push_str("</ul>");
+    body.push_str("</tbody></table></div>");
+    if changes.incomplete {
+        body.push_str("<p><small>Some last-change metadata is unavailable within the history limit. Open History to continue.</small></p>");
+    }
+    if size_unavailable {
+        body.push_str("<p><small>Some file sizes could not be read.</small></p>");
+    }
+    let mut stable = q.clone();
+    if !revision.is_empty() {
+        stable.0.insert("rev".into(), revision.to_vec());
+    }
     pagination(
         body,
-        "/files",
-        q,
+        route,
+        &stable,
         current,
         entries.len() > (current + 1) * PAGE_SIZE,
     );
     Ok(())
 }
 
-fn files(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page> {
+fn files(repo: &Repo, q: &Params, ssh: Option<&str>, list_route: &str) -> Result<Page> {
     let relative = q.bytes("path");
     fs::valid(relative)?;
     let mut body = String::new();
-    let mut revision = q.bytes("rev").to_vec();
-    let working = revision.is_empty() && !repo.git.is_bare();
-    let query = q.text("q")?.to_lowercase();
-    let mut content = None;
-    let mut working_state = None;
-    if working {
-        let before = fs::stat(root, &fs::join(&repo.gitdir, b"index")).ok();
-        let index = index(repo)?;
-        let head = head_commit(&repo.git)?;
-        working_state = Some((before, head.as_ref().map(|c| c.id())));
-        let tree = head.as_ref().map(|c| c.tree()).transpose()?;
-        let full = working_path(root, repo, &index, relative)?;
-        let st = fs::stat(root, &full)?;
-        if fs::is_dir(&st) {
-            let (entries, incomplete) =
-                list_working(root, repo, &index, tree.as_ref(), relative, &query)?;
-            directory_html(&mut body, repo, q, b"", entries, incomplete)?;
-        } else if fs::is_link(&st) {
-            let _ = write!(
-                body,
-                "<p>Symbolic link (never followed): <code>{}</code></p>",
-                label(&fs::link(root, &full)?)
-            );
-            let status = file_status(root, repo, &index, tree.as_ref(), relative, &st)?;
-            if status != "unchanged" {
-                let _ = write!(body, "<p>{}</p>", escape(&status));
-            }
-        } else if fs::is_file(&st) {
-            let status = file_status(root, repo, &index, tree.as_ref(), relative, &st)?;
-            if status != "unchanged" {
-                let _ = write!(body, "<p>{}</p>", escape(&status));
-            }
-            content = Some(fs::read(root, &full, TEXT_LIMIT));
-        } else {
-            return Err(AppError::limit(
-                "Special files, devices, and sockets are not readable.",
+    let revision = selection(&repo.git, q.bytes("rev"))?;
+    let snapshot = selected_commit(&repo.git, &revision)?;
+    let Some(snapshot) = snapshot else {
+        if !relative.is_empty() {
+            return Err(AppError::new(
+                404,
+                "This repository has no committed files yet.",
             ));
         }
+        body.push_str("<p>No commits yet.</p>");
+        body.push_str(&clone_url(repo, ssh));
+        let mut page = finish(display(&repo.relative), body)?;
+        page.revision = Some(revision);
+        return Ok(page);
+    };
+    let tree = snapshot.tree()?;
+    let query = q.text("q")?.to_lowercase();
+    let mut content = None;
+    if relative.is_empty() {
+        let (entries, incomplete) = list_tree(&repo.git, &tree, b"", &query)?;
+        directory_html(
+            &mut body,
+            repo,
+            (list_route, q),
+            &revision,
+            entries,
+            incomplete,
+            snapshot.id(),
+        )?;
     } else {
-        let snapshot = match commit(&repo.git, &revision) {
-            Ok(c) => c,
-            Err(_) if revision.is_empty() && repo.git.head().is_err() => {
-                body.push_str(&header(repo, q, ssh));
-                body.push_str("<p>This repository has no commits yet. Push a branch using SSH to begin browsing.</p>");
-                return finish(display(&repo.relative), body);
+        let entry = tree_entry(&repo.git, &tree, relative)?;
+        match entry.filemode() {
+            0o040000 => {
+                object_size(&repo.git, entry.id(), RAW_LIMIT)?;
+                let child = repo.git.find_tree(entry.id())?;
+                let (entries, incomplete) = list_tree(&repo.git, &child, relative, &query)?;
+                directory_html(
+                    &mut body,
+                    repo,
+                    (list_route, q),
+                    &revision,
+                    entries,
+                    incomplete,
+                    snapshot.id(),
+                )?;
             }
-            Err(e) => return Err(e),
-        };
-        revision = snapshot.id().to_string().into_bytes();
-        let tree = snapshot.tree()?;
-        if relative.is_empty() {
-            let (entries, incomplete) = list_tree(&repo.git, &tree, b"", &query)?;
-            directory_html(&mut body, repo, q, &revision, entries, incomplete)?;
-        } else {
-            let entry = tree_entry(&repo.git, &tree, relative)?;
-            match entry.filemode() {
-                0o040000 => {
-                    object_size(&repo.git, entry.id(), RAW_LIMIT)?;
-                    let child = repo.git.find_tree(entry.id())?;
-                    let (entries, incomplete) = list_tree(&repo.git, &child, relative, &query)?;
-                    directory_html(&mut body, repo, q, &revision, entries, incomplete)?;
-                }
-                0o160000 => {
-                    let _ = write!(
-                        body,
-                        "<p>Submodule at commit <code>{}</code>. Submodule contents are not browsed.</p>",
-                        entry.id()
-                    );
-                }
-                0o120000 => {
-                    let _ = write!(
-                        body,
-                        "<p>Symbolic link (never followed): <code>{}</code></p>",
-                        label(&blob(&repo.git, entry.id(), TEXT_LIMIT)?)
-                    );
-                }
-                _ => content = Some(blob(&repo.git, entry.id(), TEXT_LIMIT)),
+            0o160000 => {
+                let _ = write!(
+                    body,
+                    "<p>Submodule at commit <code>{}</code>. Submodule contents are not browsed.</p>",
+                    entry.id()
+                );
+            }
+            0o120000 => {
+                let _ = write!(
+                    body,
+                    "<p>Symbolic link (never followed): <code>{}</code></p>",
+                    label(&blob(&repo.git, entry.id(), TEXT_LIMIT)?)
+                );
+            }
+            _ => {
+                content = Some(blob(&repo.git, entry.id(), TEXT_LIMIT)?);
             }
         }
     }
@@ -867,7 +948,6 @@ fn files(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page
             ("path", relative),
             ("rev", revision.as_slice()),
         ];
-        actions.push_str(&a("/raw", &args, "Raw"));
         let markdown = is_markdown(relative);
         if markdown {
             let mut source = args.to_vec();
@@ -876,27 +956,23 @@ fn files(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page
                 "/files",
                 &source,
                 if q.flag("source") {
-                    "Rendered Markdown"
+                    "Markdown"
                 } else {
                     "View source"
                 },
             ));
         }
-        match bytes {
-            Ok(bytes) => body.push_str(&file_content_with_context(
-                relative,
-                &bytes,
-                markdown && !q.flag("source"),
-                &repo.relative,
-                if working { None } else { Some(&revision) },
-            )?),
-            Err(e) => return Err(e),
-        }
+        body.push_str(&file_content_with_context(
+            relative,
+            &bytes,
+            markdown && !q.flag("source"),
+            &repo.relative,
+            Some(&revision),
+        )?);
     }
-    if let Some((before, head)) = working_state {
-        state_notice(&mut body, root, repo, before, head);
+    if relative.is_empty() {
+        body.push_str(&clone_url(repo, ssh));
     }
-    body.insert_str(0, &file_context(repo, q, ssh, working, &revision, &actions));
     let mut page = finish(
         if relative.is_empty() {
             display(&repo.relative)
@@ -905,7 +981,15 @@ fn files(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page
         },
         body,
     )?;
-    page.heading = Some(file_heading(&repo.relative, relative, &revision));
+    page.breadcrumbs = Some(crate::render::breadcrumbs(
+        &repo.relative,
+        relative,
+        Some(&revision),
+        None,
+    ));
+    page.show_heading = false;
+    page.actions = actions;
+    page.revision = Some(revision);
     Ok(page)
 }
 fn is_markdown(path: &[u8]) -> bool {
@@ -913,195 +997,108 @@ fn is_markdown(path: &[u8]) -> bool {
     text.ends_with(".md") || text.ends_with(".markdown") || text.ends_with(".mdown")
 }
 
-pub fn raw(root: &Root, q: &Params) -> Result<Raw> {
+pub fn raw(root: &Root, q: &Params) -> Result<Vec<u8>> {
     let repo = repository(root, q.bytes("repo"))?;
     let relative = q.bytes("path");
     fs::valid(relative)?;
     if relative.is_empty() {
         return Err(AppError::bad("A file path is required."));
     }
-    if q.bytes("rev").is_empty() && !repo.git.is_bare() {
-        let index = index(&repo)?;
-        let full = working_path(root, &repo, &index, relative)?;
-        let file = root.open(&full, false)?;
-        if !file.metadata()?.is_file() {
-            return Err(AppError::limit("Only regular files can be downloaded."));
-        }
-        return Ok(Raw::File(file));
-    }
-    let snapshot = commit(&repo.git, q.bytes("rev"))?;
+    let snapshot = if q.bytes("rev").is_empty() {
+        head_commit(&repo.git)?
+            .ok_or_else(|| AppError::new(404, "This repository has no committed files yet."))?
+    } else {
+        commit(&repo.git, q.bytes("rev"))?
+    };
     let entry = tree_entry(&repo.git, &snapshot.tree()?, relative)?;
     if entry.filemode() == 0o120000 || entry.filemode() == 0o160000 {
         return Err(AppError::limit(
             "Symbolic links and submodules cannot be downloaded as files.",
         ));
     }
-    Ok(Raw::Bytes(blob(&repo.git, entry.id(), RAW_LIMIT)?))
+    blob(&repo.git, entry.id(), RAW_LIMIT)
 }
 
-fn conversion(repo: &Repository, relative: &[u8]) -> Result<bool> {
-    let config = repo.config()?;
-    if config
-        .get_string("core.autocrlf")
-        .is_ok_and(|s| s != "false" && s != "0")
-    {
-        return Ok(true);
-    }
-    for attribute in ["filter", "text", "eol", "working-tree-encoding", "ident"] {
-        let value = repo.get_attr_bytes(
-            path(relative),
-            attribute,
-            git2::AttrCheckFlags::FILE_THEN_INDEX | git2::AttrCheckFlags::NO_SYSTEM,
-        )?;
-        if !matches!(
-            git2::AttrValue::from_bytes(value),
-            git2::AttrValue::False | git2::AttrValue::Unspecified
-        ) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn working_bytes(root: &Root, repo: &Repo, relative: &[u8], st: &libc::stat) -> Result<Vec<u8>> {
-    let full = fs::join(&repo.relative, relative);
-    if fs::is_link(st) {
-        return fs::link(root, &full);
-    }
-    if !fs::is_file(st) {
-        return Err(AppError::limit(
-            "Special files and submodule directories are not compared.",
-        ));
-    }
-    fs::read(root, &full, TEXT_LIMIT)
-}
-
-fn file_status(
-    root: &Root,
-    repo: &Repo,
-    index: &Index,
-    head: Option<&Tree<'_>>,
-    relative: &[u8],
-    st: &libc::stat,
-) -> Result<String> {
-    let Some(entry) = index.get_path(path(relative), 0) else {
-        if (1..=3).any(|stage| index.get_path(path(relative), stage).is_some()) {
-            return Ok("conflicted".into());
-        }
-        return Ok("untracked".into());
-    };
-    let mut statuses = Vec::new();
-    let head_entry = head.map(|t| tree_entry(&repo.git, t, relative)).transpose();
-    let head_entry = match head_entry {
-        Ok(entry) => entry,
-        Err(e) if e.status == 404 => None,
-        Err(e) => return Err(e),
-    };
-    if head_entry
-        .as_ref()
-        .is_none_or(|e| e.id() != entry.id || e.filemode() as u32 != entry.mode)
-    {
-        statuses.push("staged");
-    }
-    if conversion(&repo.git, relative)? {
-        statuses.push("conversion configured: working bytes not compared");
-    } else if st.st_size > TEXT_LIMIT as i64 {
-        statuses.push("working comparison exceeds 1 MiB limit");
-    } else {
-        let bytes = working_bytes(root, repo, relative, st)?;
-        let mode = if fs::is_link(st) {
-            0o120000
-        } else if st.st_mode & 0o111 != 0
-            && repo.git.config()?.get_bool("core.filemode").unwrap_or(true)
-        {
-            0o100755
-        } else {
-            0o100644
-        };
-        let check_mode = entry.mode == 0o120000
-            || mode == 0o120000
-            || repo.git.config()?.get_bool("core.filemode").unwrap_or(true);
-        if Oid::hash_object(ObjectType::Blob, &bytes)? != entry.id
-            || (check_mode && mode != entry.mode)
-        {
-            statuses.push("unstaged");
-        }
-    }
-    if statuses.is_empty() {
-        Ok("unchanged".into())
-    } else {
-        Ok(statuses.join(" · "))
-    }
-}
-
-fn refs(repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page> {
-    let mut body = header(repo, q, ssh);
+fn refs(repo: &Repo, q: &Params, route: &str, tags: bool) -> Result<Page> {
+    let name = if tags { "Tags" } else { "Branches" };
+    let mut body = String::new();
     let mut items = Vec::new();
     let mut incomplete = false;
+    let mut scanned = 0;
     for reference in repo.git.references()? {
         let reference = reference?;
-        if !reference.is_branch() && !reference.is_tag() && !reference.is_remote() {
-            continue;
-        }
-        if items.len() == PATH_LIMIT {
+        scanned += 1;
+        if scanned > PATH_LIMIT {
             incomplete = true;
             break;
         }
-        let name = reference.name_bytes().to_vec();
-        let id = reference.resolve()?.target();
-        let kind = if reference.is_tag() {
-            "tag"
-        } else if reference.is_remote() {
-            "remote branch"
+        if if tags {
+            !reference.is_tag()
         } else {
-            "branch"
-        };
-        items.push((name, id, kind));
+            !reference.is_branch() && !reference.is_remote()
+        } {
+            continue;
+        }
+        let reference_name = reference.name_bytes().to_vec();
+        let id = reference.resolve()?.target();
+        items.push((reference_name, id));
     }
     items.sort_by(|a, b| a.0.cmp(&b.0));
     if incomplete {
         body.push_str("<p><strong>Incomplete reference list:</strong> the 10,000 reference limit was reached.</p>");
     }
     if items.is_empty() {
-        body.push_str("<p>No branches or tags yet.</p>");
+        let _ = write!(body, "<p>No {} yet.</p>", name.to_lowercase());
     }
-    body.push_str("<ul>");
+    body.push_str("<div role=\"region\" aria-label=\"Reference list\" tabindex=\"0\"><table aria-label=\"References\"><thead><tr><th scope=\"col\">Name</th><th scope=\"col\">Commit</th><th scope=\"col\">Author</th><th scope=\"col\">Age</th></tr></thead><tbody>");
     let current = q.page()?;
-    for (name, id, kind) in items.iter().skip(current * PAGE_SIZE).take(PAGE_SIZE) {
-        let shown = name
+    for (reference_name, id) in items.iter().skip(current * PAGE_SIZE).take(PAGE_SIZE) {
+        let shown = reference_name
             .strip_prefix(b"refs/heads/")
-            .or_else(|| name.strip_prefix(b"refs/tags/"))
-            .or_else(|| name.strip_prefix(b"refs/remotes/"))
-            .unwrap_or(name);
+            .or_else(|| reference_name.strip_prefix(b"refs/tags/"))
+            .or_else(|| reference_name.strip_prefix(b"refs/remotes/"))
+            .unwrap_or(reference_name);
         let revision = id.map(|v| v.to_string()).unwrap_or_default();
         let _ = write!(
             body,
-            "<li>{} <small>{}</small> · {}</li>",
-            a(
-                "/files",
-                &[("repo", &repo.relative), ("rev", revision.as_bytes())],
-                &display(shown)
-            ),
-            kind,
-            a(
-                "/history",
-                &[("repo", &repo.relative), ("rev", revision.as_bytes())],
-                "history"
-            )
+            "<tr><td>{}</td>",
+            revision_link(route, q, reference_name, &metadata::short_text(shown, 1024))
         );
+        if let Ok(c) = commit(&repo.git, revision.as_bytes()) {
+            let stamp = date(c.time().seconds());
+            let iso = stamp.trim_end_matches(" UTC").replacen(' ', "T", 1) + "Z";
+            let _ = write!(
+                body,
+                "<td><code>{}</code></td><td>{}</td><td><time datetime=\"{}\" title=\"{}\">{}</time></td></tr>",
+                revision_link(
+                    route,
+                    q,
+                    c.id().to_string().as_bytes(),
+                    &c.id().to_string()[..7]
+                ),
+                escape(&metadata::short_text(c.author().name_bytes(), 128)),
+                escape(&iso),
+                escape(&stamp),
+                age(c.time().seconds())
+            );
+        } else {
+            body.push_str("<td>—</td><td>—</td><td>—</td></tr>");
+        }
+        if body.len() > HTML_LIMIT - 65536 {
+            return Err(AppError::limit(
+                "Reference metadata exceeds the page output limit.",
+            ));
+        }
     }
-    body.push_str("</ul>");
+    body.push_str("</tbody></table></div>");
     pagination(
         &mut body,
-        "/refs",
+        route,
         q,
         current,
         items.len() > (current + 1) * PAGE_SIZE,
     );
-    finish(
-        format!("Branches & tags — {}", display(&repo.relative)),
-        body,
-    )
+    finish(format!("{name} — {}", display(&repo.relative)), body)
 }
 
 fn date(seconds: i64) -> String {
@@ -1125,15 +1122,12 @@ fn date(seconds: i64) -> String {
     )
 }
 
-fn history(repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page> {
-    let mut body = header(repo, q, ssh);
-    let start = match commit(&repo.git, q.bytes("rev")) {
-        Ok(c) => c,
-        Err(_) if q.bytes("rev").is_empty() && repo.git.head().is_err() => {
-            body.push_str("<p>No commits yet.</p>");
-            return finish(format!("History — {}", display(&repo.relative)), body);
-        }
-        Err(e) => return Err(e),
+fn history(repo: &Repo, q: &Params, _ssh: Option<&str>) -> Result<Page> {
+    let mut body = String::new();
+    let revision = selection(&repo.git, q.bytes("rev"))?;
+    let Some(start) = selected_commit(&repo.git, &revision)? else {
+        body.push_str("<p>No commits yet.</p>");
+        return finish(format!("History — {}", display(&repo.relative)), body);
     };
     let current = q.page()?;
     if current >= PATH_LIMIT / HISTORY_SIZE {
@@ -1141,19 +1135,13 @@ fn history(repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page> {
             "History browsing stops after 10,000 commits. Select an older full commit ID to continue.",
         ));
     }
-    let pinned = start.id().to_string();
     let mut stable = q.clone();
-    stable.0.insert("rev".into(), pinned.as_bytes().to_vec());
-    let _ = write!(
-        body,
-        "<p>History from <code>{}</code>. Most recent commits first.</p>",
-        escape(&pinned)
-    );
+    stable.0.insert("rev".into(), revision.clone());
     let mut walk = repo.git.revwalk()?;
     walk.set_sorting(git2::Sort::TIME)?;
     walk.push(start.id())?;
     let mut more = false;
-    body.push_str("<ol>");
+    body.push_str("<div role=\"region\" aria-label=\"Commit history\" tabindex=\"0\"><table aria-label=\"History\"><thead><tr><th scope=\"col\">Message</th><th scope=\"col\">Commit</th><th scope=\"col\">Author</th><th scope=\"col\">Date</th></tr></thead><tbody>");
     for (n, id) in walk
         .skip(current * HISTORY_SIZE)
         .take(HISTORY_SIZE + 1)
@@ -1174,13 +1162,14 @@ fn history(repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page> {
         let author = c.author();
         let _ = write!(
             body,
-            "<li>{}<br><small><code>{}</code> · {} · {}</small></li>",
-            a(
-                "/commit",
-                &[("repo", &repo.relative), ("id", id.to_string().as_bytes())],
-                &display(summary)
+            "<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+            revision_link("/history", q, id.to_string().as_bytes(), &display(summary)),
+            revision_link(
+                "/history",
+                q,
+                id.to_string().as_bytes(),
+                &id.to_string()[..10]
             ),
-            &id.to_string()[..10],
             label(author.name_bytes()),
             escape(&date(c.time().seconds()))
         );
@@ -1190,581 +1179,56 @@ fn history(repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page> {
             ));
         }
     }
-    body.push_str("</ol>");
+    body.push_str("</tbody></table></div>");
     pagination(&mut body, "/history", &stable, current, more);
-    finish(format!("History — {}", display(&repo.relative)), body)
-}
-
-#[derive(Clone)]
-struct Delta {
-    path: Vec<u8>,
-    old: Option<Oid>,
-    new: Option<Oid>,
-    old_mode: u32,
-    new_mode: u32,
-    kind: &'static str,
-}
-
-fn diff_options() -> git2::DiffOptions {
-    let mut options = git2::DiffOptions::new();
-    options
-        .update_index(false)
-        .include_typechange(true)
-        .ignore_submodules(false)
-        .skip_binary_check(true)
-        .max_size(TEXT_LIMIT as i64)
-        .context_lines(3);
-    options
-}
-
-fn delta_list(diff: &git2::Diff<'_>) -> Result<Vec<Delta>> {
-    if diff.deltas().len() > PATH_LIMIT {
-        return Err(AppError::limit(
-            "This comparison exceeds 10,000 changed paths. Use local Git.",
-        ));
-    }
-    let mut out = Vec::new();
-    for d in diff.deltas() {
-        let old = d.old_file();
-        let new = d.new_file();
-        let relative = new
-            .path_bytes()
-            .or_else(|| old.path_bytes())
-            .unwrap_or(b"")
-            .to_vec();
-        let kind = match d.status() {
-            git2::Delta::Added => "added",
-            git2::Delta::Deleted => "deleted",
-            git2::Delta::Typechange => "type changed",
-            git2::Delta::Conflicted => "conflicted",
-            _ => "modified",
-        };
-        out.push(Delta {
-            path: relative,
-            old: if old.id().is_zero() {
-                None
-            } else {
-                Some(old.id())
-            },
-            new: if new.id().is_zero() {
-                None
-            } else {
-                Some(new.id())
-            },
-            old_mode: u32::from(old.mode()),
-            new_mode: u32::from(new.mode()),
-            kind,
-        });
-    }
-    Ok(out)
-}
-
-fn render_patch(body: &mut String, relative: &[u8], old: &[u8], new: &[u8]) -> Result<()> {
-    let lines = |bytes: &[u8]| {
-        bytes.iter().filter(|b| **b == b'\n').count()
-            + usize::from(!bytes.is_empty() && bytes.last() != Some(&b'\n'))
-    };
-    if old.len() > TEXT_LIMIT
-        || new.len() > TEXT_LIMIT
-        || lines(old) > LINE_LIMIT
-        || lines(new) > LINE_LIMIT
-    {
-        body.push_str("<p>Diff omitted: a side exceeds 1 MiB or 20,000 lines. Use local Git.</p>");
-        return Ok(());
-    }
-    if old.contains(&0) || new.contains(&0) {
-        body.push_str("<p>Binary contents differ. Download a snapshot or use local Git.</p>");
-        return Ok(());
-    }
-    let mut options = diff_options();
-    let patch = git2::Patch::from_buffers(
-        old,
-        Some(path(relative)),
-        new,
-        Some(path(relative)),
-        Some(&mut options),
-    )?;
-    if patch.num_hunks() == 0 {
-        body.push_str("<p>No text changes.</p>");
-        return Ok(());
-    }
-    body.push_str("<pre tabindex=\"0\" aria-label=\"Unified diff\"><code>");
-    for h in 0..patch.num_hunks() {
-        let (hunk, lines) = patch.hunk(h)?;
-        body.push_str(&escape(&String::from_utf8_lossy(hunk.header())));
-        for n in 0..lines {
-            let line = patch.line_in_hunk(h, n)?;
-            let old = line.old_lineno().map(|v| v.to_string()).unwrap_or_default();
-            let new = line.new_lineno().map(|v| v.to_string()).unwrap_or_default();
-            let content = escape(&String::from_utf8_lossy(line.content()));
-            match line.origin() {
-                '+' => {
-                    let _ = write!(body, "<ins>{old:>5} {new:>5} +{content}</ins>");
-                }
-                '-' => {
-                    let _ = write!(body, "<del>{old:>5} {new:>5} -{content}</del>");
-                }
-                ' ' => {
-                    let _ = write!(body, "{old:>5} {new:>5}  {content}");
-                }
-                _ => {
-                    let _ = write!(body, "              {content}");
-                }
-            }
-            if body.len() > HTML_LIMIT - 65536 {
-                body.push_str("</code></pre><p><strong>Diff truncated at the 2 MiB page output limit.</strong> Use local Git for the complete comparison.</p>");
-                return Ok(());
-            }
-        }
-    }
-    body.push_str("</code></pre>");
-    Ok(())
-}
-
-fn render_deltas(body: &mut String, repo: &Repo, deltas: &[Delta], revision: &[u8]) -> Result<()> {
-    if deltas.is_empty() {
-        body.push_str("<p>No changes.</p>");
-        return Ok(());
-    }
-    for delta in deltas {
-        if body.len() > HTML_LIMIT - 131072 {
-            body.push_str(
-                "<p><strong>Remaining files omitted at the 2 MiB page output limit.</strong></p>",
-            );
-            break;
-        }
-        let _ = write!(
-            body,
-            "<section><h3>{} <small>{}</small></h3>",
-            label(&delta.path),
-            delta.kind
-        );
-        if delta.old_mode != delta.new_mode {
-            let _ = write!(
-                body,
-                "<p>Mode <code>{:06o}</code> → <code>{:06o}</code></p>",
-                delta.old_mode, delta.new_mode
-            );
-        }
-        if delta.old_mode == 0o160000 || delta.new_mode == 0o160000 {
-            let _ = write!(
-                body,
-                "<p>Submodule commit <code>{}</code> → <code>{}</code>. Submodule contents are not browsed.</p>",
-                delta
-                    .old
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "absent".into()),
-                delta
-                    .new
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "absent".into())
-            );
-        } else {
-            let old = delta
-                .old
-                .map(|id| blob(&repo.git, id, TEXT_LIMIT))
-                .transpose();
-            let new = delta
-                .new
-                .map(|id| blob(&repo.git, id, TEXT_LIMIT))
-                .transpose();
-            match (old, new) {
-                (Ok(old), Ok(new)) => render_patch(
-                    body,
-                    &delta.path,
-                    old.as_deref().unwrap_or(b""),
-                    new.as_deref().unwrap_or(b""),
-                )?,
-                (Err(e), _) | (_, Err(e)) => {
-                    let _ = write!(body, "<p>Diff unavailable: {}</p>", escape(&e.message));
-                }
-            }
-            if delta.new.is_some() {
-                body.push_str(&format!(
-                    "<p>{}</p>",
-                    a(
-                        "/files",
-                        &[
-                            ("repo", &repo.relative),
-                            ("path", &delta.path),
-                            ("rev", revision)
-                        ],
-                        if revision.is_empty() {
-                            "View working file"
-                        } else {
-                            "View file"
-                        }
-                    )
-                ));
-            }
-        }
-        body.push_str("</section>");
-    }
-    Ok(())
-}
-
-fn commit_page(repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page> {
-    let c = commit(&repo.git, q.bytes("id"))?;
-    let mut body = header(repo, q, ssh);
-    let id = c.id().to_string();
-    let author = c.author();
-    let committer = c.committer();
-    let _ = write!(
-        body,
-        "<p><code>{id}</code></p><dl><dt>Author</dt><dd>{} &lt;{}&gt;</dd><dt>Author date</dt><dd>{}</dd><dt>Committer</dt><dd>{} &lt;{}&gt;</dd><dt>Commit date</dt><dd>{}</dd></dl><pre tabindex=\"0\" aria-label=\"Commit message\">{}</pre><p>{}</p>",
-        label(author.name_bytes()),
-        label(author.email_bytes()),
-        escape(&date(author.when().seconds())),
-        label(committer.name_bytes()),
-        label(committer.email_bytes()),
-        escape(&date(committer.when().seconds())),
-        escape(&String::from_utf8_lossy(c.message_bytes())),
-        a(
-            "/files",
-            &[("repo", &repo.relative), ("rev", id.as_bytes())],
-            "Browse this snapshot"
-        )
-    );
-    if c.parent_count() > 0 {
-        body.push_str("<p>Parents: ");
-        for parent in c.parent_ids() {
-            body.push_str(&a(
-                "/commit",
-                &[
-                    ("repo", &repo.relative),
-                    ("id", parent.to_string().as_bytes()),
-                ],
-                &parent.to_string(),
-            ));
-            body.push(' ');
-        }
-        body.push_str("</p>");
-    }
-    body.push_str("<h2>Changes</h2>");
-    let old = if c.parent_count() > 0 {
-        let parent_id = c.parent_id(0)?;
-        match commit(&repo.git, parent_id.to_string().as_bytes()) {
-            Ok(parent) => Some(parent.tree()?),
-            Err(_) => {
-                body.push_str("<p>The first parent is unavailable in this shallow or incomplete repository. No parent diff can be shown.</p>");
-                return finish(
-                    format!("Commit {} — {}", &id[..10], display(&repo.relative)),
-                    body,
-                );
-            }
-        }
-    } else {
-        None
-    };
-    if c.parent_count() > 1 {
-        body.push_str("<p>Merge commit. Showing the diff against its first parent.</p>");
-    } else if old.is_none() {
-        body.push_str("<p>Root commit. Comparing against an empty tree.</p>");
-    }
-    let new = c.tree()?;
-    let mut options = diff_options();
-    let diff = repo
-        .git
-        .diff_tree_to_tree(old.as_ref(), Some(&new), Some(&mut options))?;
-    render_deltas(&mut body, repo, &delta_list(&diff)?, id.as_bytes())?;
-    finish(
-        format!("Commit {} — {}", &id[..10], display(&repo.relative)),
-        body,
-    )
-}
-
-fn compare(repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page> {
-    let mut body = header(repo, q, ssh);
-    let _ = write!(
-        body,
-        "<p>Compare two endpoint snapshots. Enter branch names, tags, or full commit IDs.</p><form method=\"get\" action=\"/compare\">{}<label>From <input name=\"from\" value=\"{}\" required></label><label>To <input name=\"to\" value=\"{}\" required></label><button type=\"submit\">Compare</button></form>",
-        hidden("repo", &repo.relative),
-        escape(q.text("from")?),
-        escape(q.text("to")?)
-    );
-    if q.bytes("from").is_empty() && q.bytes("to").is_empty() {
-        return finish(format!("Compare — {}", display(&repo.relative)), body);
-    }
-    if q.bytes("from").is_empty() || q.bytes("to").is_empty() {
-        return Err(AppError::bad("Choose both snapshots."));
-    }
-    let old = commit(&repo.git, q.bytes("from"))?;
-    let new = commit(&repo.git, q.bytes("to"))?;
-    let _ = write!(
-        body,
-        "<p><code>{}</code> → <code>{}</code></p><h2>Changes</h2>",
-        old.id(),
-        new.id()
-    );
-    let mut options = diff_options();
-    let diff =
-        repo.git
-            .diff_tree_to_tree(Some(&old.tree()?), Some(&new.tree()?), Some(&mut options))?;
-    render_deltas(
-        &mut body,
-        repo,
-        &delta_list(&diff)?,
-        new.id().to_string().as_bytes(),
-    )?;
-    finish(format!("Compare — {}", display(&repo.relative)), body)
-}
-
-fn changes(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page> {
-    if repo.git.is_bare() {
-        return Err(AppError::limit(
-            "Bare repositories have no working tree or index changes.",
-        ));
-    }
-    let mut body = header(repo, q, ssh);
-    body.push_str("<p>Staged compares HEAD with the index. Unstaged compares the index with files on disk. Working files can change during a request; refresh for current content.</p>");
-    let before = fs::stat(root, &fs::join(&repo.gitdir, b"index")).ok();
-    let index = index(repo)?;
-    let head = head_commit(&repo.git)?;
-    let head_id = head.as_ref().map(|c| c.id());
-    let tree = head.as_ref().map(|c| c.tree()).transpose()?;
-    let mut options = diff_options();
-    let diff = repo
-        .git
-        .diff_tree_to_index(tree.as_ref(), Some(&index), Some(&mut options))?;
-    body.push_str("<h2>Staged</h2>");
-    render_deltas(&mut body, repo, &delta_list(&diff)?, b"")?;
-    let mut conflicts = BTreeSet::new();
-    let mut staged_paths = BTreeMap::new();
-    for entry in index.iter() {
-        if entry.flags & 0x3000 != 0 {
-            conflicts.insert(entry.path);
-        } else {
-            staged_paths.insert(entry.path.clone(), entry);
-        }
-    }
-    if !conflicts.is_empty() {
-        body.push_str("<h2>Conflicts</h2><p>Resolve these paths using local Git. gitt does not choose a side.</p><ul>");
-        for relative in &conflicts {
-            body.push_str(&format!(
-                "<li>{}</li>",
-                a(
-                    "/files",
-                    &[("repo", &repo.relative), ("path", relative)],
-                    &display(relative)
-                )
-            ));
-        }
-        body.push_str("</ul>");
-    }
-    body.push_str("<h2>Unstaged</h2>");
-    let mut changed = 0;
-    for (relative, entry) in &staged_paths {
-        if changed >= PATH_LIMIT || body.len() > HTML_LIMIT - 131072 {
-            body.push_str(
-                "<p><strong>Remaining changes omitted at a path or page output limit.</strong></p>",
-            );
-            break;
-        }
-        if conflicts.contains(relative) {
-            continue;
-        }
-        if entry.mode == 0o160000 {
-            body.push_str(&format!(
-                "<p><code>{}</code>: submodule working state is not inspected.</p>",
-                label(relative)
-            ));
-            continue;
-        }
-        fs::valid(relative)?;
-        let full = fs::join(&repo.relative, relative);
-        let st = match fs::stat(root, &full) {
-            Ok(st) => Some(st),
-            Err(e) if e.status == 404 => None,
-            Err(e) => {
-                body.push_str(&format!(
-                    "<p><code>{}</code>: {}</p>",
-                    label(relative),
-                    escape(&e.message)
-                ));
-                continue;
-            }
-        };
-        if st.is_some() && conversion(&repo.git, relative)? {
-            body.push_str(&format!("<p><code>{}</code>: working comparison unavailable because text conversion or a filter is configured. No filter is executed.</p>",label(relative)));
-            changed += 1;
-            continue;
-        }
-        let old = blob(&repo.git, entry.id, TEXT_LIMIT);
-        let new = st
-            .as_ref()
-            .map(|st| working_bytes(root, repo, relative, st))
-            .transpose();
-        match (old, new) {
-            (Ok(old), Ok(new)) => {
-                let new_bytes = new.as_deref().unwrap_or(b"");
-                let mode = st
-                    .as_ref()
-                    .map(|st| {
-                        if fs::is_link(st) {
-                            0o120000
-                        } else if st.st_mode & 0o111 != 0 {
-                            0o100755
-                        } else {
-                            0o100644
-                        }
-                    })
-                    .unwrap_or(0);
-                let mode_changed = mode != entry.mode
-                    && (mode == 0o120000
-                        || entry.mode == 0o120000
-                        || repo.git.config()?.get_bool("core.filemode").unwrap_or(true));
-                if new.is_some() && old == new_bytes && !mode_changed {
-                    continue;
-                }
-                changed += 1;
-                let _ = write!(
-                    body,
-                    "<section><h3>{} <small>{}</small></h3>",
-                    label(relative),
-                    if new.is_none() { "deleted" } else { "modified" }
-                );
-                if mode_changed {
-                    let _ = write!(
-                        body,
-                        "<p>Mode <code>{:06o}</code> → <code>{mode:06o}</code></p>",
-                        entry.mode
-                    );
-                }
-                render_patch(&mut body, relative, &old, new_bytes)?;
-                if new.is_some() {
-                    body.push_str(&format!(
-                        "<p>{}</p>",
-                        a(
-                            "/files",
-                            &[("repo", &repo.relative), ("path", relative)],
-                            "View working file"
-                        )
-                    ));
-                }
-                body.push_str("</section>");
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                changed += 1;
-                let _ = write!(
-                    body,
-                    "<p><code>{}</code>: comparison unavailable: {}</p>",
-                    label(relative),
-                    escape(&e.message)
-                );
-            }
-        }
-    }
-    if changed == 0 {
-        body.push_str("<p>No unstaged changes.</p>");
-    }
-    body.push_str("<h2>Untracked</h2>");
-    let mut pending = vec![Vec::new()];
-    let mut count = 0;
-    let mut untracked = 0;
-    let mut incomplete = false;
-    body.push_str("<ul>");
-    while let Some(directory) = pending.pop() {
-        let full = fs::join(&repo.relative, &directory);
-        let entries = fs::entries(&root.open(&full, true)?, PATH_LIMIT)?;
-        incomplete |= entries.incomplete;
-        for name in entries.names {
-            if name == b".git" {
-                continue;
-            }
-            count += 1;
-            if count > PATH_LIMIT || body.len() > HTML_LIMIT - 65536 {
-                incomplete = true;
-                break;
-            }
-            let relative = fs::join(&directory, &name);
-            if staged_paths.contains_key(&relative) || conflicts.contains(&relative) {
-                continue;
-            }
-            if repo.git.is_path_ignored(path(&relative))? {
-                continue;
-            }
-            let st = fs::stat(root, &fs::join(&repo.relative, &relative))?;
-            if fs::is_dir(&st) {
-                if fs::stat(
-                    root,
-                    &fs::join(&fs::join(&repo.relative, &relative), b".git"),
-                )
-                .is_ok()
-                {
-                    body.push_str(&format!(
-                        "<li><code>{}/</code> (nested repository; contents not browsed)</li>",
-                        label(&relative)
-                    ));
-                    untracked += 1;
-                } else {
-                    pending.push(relative);
-                }
-            } else {
-                body.push_str(&format!(
-                    "<li>{}</li>",
-                    a(
-                        "/files",
-                        &[("repo", &repo.relative), ("path", &relative)],
-                        &display(&relative)
-                    )
-                ));
-                untracked += 1;
-            }
-        }
-        if count > PATH_LIMIT || body.len() > HTML_LIMIT - 65536 {
-            break;
-        }
-    }
-    body.push_str("</ul>");
-    if untracked == 0 {
-        body.push_str("<p>No untracked files.</p>");
-    }
-    if incomplete {
-        body.push_str("<p><strong>Incomplete untracked listing:</strong> a scan or output limit was reached.</p>");
-    }
-    state_notice(&mut body, root, repo, before, head_id);
-    finish(format!("Changes — {}", display(&repo.relative)), body)
-}
-
-fn state_notice(
-    body: &mut String,
-    root: &Root,
-    repo: &Repo,
-    before: Option<libc::stat>,
-    head_id: Option<Oid>,
-) {
-    let after = fs::stat(root, &fs::join(&repo.gitdir, b"index")).ok();
-    let index_changed = match (before, after) {
-        (Some(a), Some(b)) => {
-            a.st_mtime != b.st_mtime
-                || a.st_mtime_nsec != b.st_mtime_nsec
-                || a.st_size != b.st_size
-                || a.st_ino != b.st_ino
-                || a.st_ctime != b.st_ctime
-                || a.st_ctime_nsec != b.st_ctime_nsec
-        }
-        (None, None) => false,
-        _ => true,
-    };
-    if index_changed || repo.git.head().ok().and_then(|h| h.target()) != head_id {
-        body.push_str("<p><strong>HEAD or the index changed during this request.</strong> Refresh before relying on this comparison.</p>");
-    }
+    let mut page = finish(format!("History — {}", display(&repo.relative)), body)?;
+    page.revision = Some(revision);
+    Ok(page)
 }
 
 pub fn page(root: &Root, route: &str, q: &Params, ssh_prefix: Option<&str>) -> Result<Page> {
     if route == "/" {
         return repositories(root, q);
     }
-    let repo = repository(root, q.bytes("repo"))?;
-    match route {
-        "/files" => files(root, &repo, q, ssh_prefix),
-        "/refs" => refs(&repo, q, ssh_prefix),
-        "/history" => history(&repo, q, ssh_prefix),
-        "/commit" => commit_page(&repo, q, ssh_prefix),
-        "/compare" => compare(&repo, q, ssh_prefix),
-        "/changes" => changes(root, &repo, q, ssh_prefix),
-        _ => Err(AppError::new(404, "Page not found.")),
+    if route == "/search" {
+        return search(root, q);
     }
+    if !matches!(
+        route,
+        "/files" | "/branches" | "/refs" | "/tags" | "/history"
+    ) {
+        return Err(AppError::new(404, "Page not found."));
+    }
+    let repo = repository(root, q.bytes("repo"))?;
+    let revision = selection(&repo.git, q.bytes("rev"))?;
+    let mut selected = q.clone();
+    selected.0.insert("rev".into(), revision.clone());
+    let q = &selected;
+    let mut page = match route {
+        "/files" => files(&repo, q, ssh_prefix, route),
+        "/branches" | "/refs" => refs(&repo, q, route, false),
+        "/tags" => refs(&repo, q, route, true),
+        "/history" => history(&repo, q, ssh_prefix),
+        _ => unreachable!(),
+    }?;
+    page.show_heading = false;
+    page.active_tab = Some(match route {
+        "/branches" | "/refs" => "Branches",
+        "/tags" => "Tags",
+        "/history" => "History",
+        _ => "Files",
+    });
+    page.context = crate::render::revision_context(&revision, repo.git.is_shallow());
+    if page.breadcrumbs.is_none() {
+        page.breadcrumbs = Some(crate::render::breadcrumbs(
+            &repo.relative,
+            b"",
+            Some(&revision),
+            None,
+        ));
+    }
+    page.revision = Some(revision);
+    Ok(page)
 }
 
 #[cfg(test)]
@@ -1831,28 +1295,270 @@ mod tests {
     }
 
     #[test]
-    fn working_changes_are_separate_and_read_only() {
+    fn repository_metadata_follows_head_and_preserves_empty_branch_names() {
+        let f = Fixture::new();
+        let (branch, change) = repository_metadata(&f.root, b"demo", b"").unwrap();
+        assert_eq!(branch, b"refs/heads/main");
+        assert!(change.is_none());
+
+        f.put(b"file.txt", b"first\n");
+        f.stage(b"file.txt");
+        let first = f.commit("First version\n\nCommit body is not a summary");
+        f.put(b"file.txt", b"second\n");
+        f.stage(b"file.txt");
+        let second = f.commit("Second version");
+        f.put(b"file.txt", b"uncommitted\n");
+        let (branch, change) = repository_metadata(&f.root, b"demo", b"").unwrap();
+        let change = change.unwrap();
+        assert_eq!(branch, b"refs/heads/main");
+        assert_eq!(change.commit, second);
+        assert_eq!(change.message, "Second version");
+        assert_eq!(change.author, "Terry");
+        assert_eq!(change.timestamp, 1_700_000_000);
+
+        f.git.set_head_detached(first).unwrap();
+        let (branch, change) = repository_metadata(&f.root, b"demo", b"").unwrap();
+        let change = change.unwrap();
+        assert_eq!(branch, first.to_string().as_bytes());
+        assert_eq!(change.commit, first);
+        assert_eq!(change.message, "First version");
+    }
+
+    #[test]
+    fn repository_listing_escapes_metadata_and_survives_unavailable_repositories() {
+        let f = Fixture::new();
+        f.put(b"file.txt", b"one\n");
+        f.stage(b"file.txt");
+        let id = f.commit("Fix <script> & display\n\nPrivate commit body");
+        Repository::init_bare(f.directory.join("empty.git")).unwrap();
+        std::fs::create_dir(f.directory.join("unsupported")).unwrap();
+        std::fs::write(f.directory.join("unsupported/.git"), "gitdir: /outside\n").unwrap();
+        let q = Params::parse("").unwrap();
+        let listing = repositories(&f.root, &q).unwrap();
+        assert!(listing.body.contains("Fix &lt;script&gt; &amp; display"));
+        assert!(!listing.body.contains("Private commit body"));
+        assert!(listing.body.contains(&format!("rev={id}")));
+        assert!(listing.body.contains(">empty.git</a>"));
+        assert!(listing.body.contains(">unsupported</a>"));
+        assert!(!listing.body.contains(">Kind</th>"));
+
+        std::fs::write(f.directory.join("demo/.git/HEAD"), "invalid HEAD\n").unwrap();
+        let listing = repositories(&f.root, &q).unwrap();
+        assert!(listing.body.contains(">demo</a></td><td>—</td>"));
+        assert!(listing.body.contains(">empty.git</a>"));
+    }
+
+    #[test]
+    fn directory_metadata_uses_committed_sizes_and_selected_history() {
+        let f = Fixture::new();
+        f.put(b"file.txt", b"one\n");
+        f.stage(b"file.txt");
+        let first = f.commit("First version");
+        f.put(b"file.txt", b"second version\n");
+        f.stage(b"file.txt");
+        f.commit("Second version");
+        f.put(b"file.txt", b"uncommitted on disk\n");
+        f.put(b"new.txt", b"new\n");
+        let disk = page(&f.root, "/files", &f.params(""), None).unwrap();
+        assert!(disk.body.contains("Second version"));
+        assert!(disk.body.contains("15 B"));
+        assert!(!disk.body.contains("new.txt"));
+        assert!(!disk.body.contains("unchanged"));
+        assert!(!disk.body.contains("untracked"));
+        let snapshot = page(&f.root, "/files", &f.params(&format!("rev={first}")), None).unwrap();
+        assert!(snapshot.body.contains("First version"));
+        assert!(!snapshot.body.contains("Second version"));
+        assert!(snapshot.body.contains("4 B"));
+        assert!(!snapshot.body.contains("new.txt"));
+        assert!(snapshot.breadcrumbs.as_ref().unwrap().contains("gitt"));
+    }
+
+    #[test]
+    fn branches_and_tags_are_independent_and_preserve_snapshot_links() {
+        let f = Fixture::new();
+        f.put(b"file.txt", b"one\n");
+        f.stage(b"file.txt");
+        let id = f.commit("First");
+        f.git
+            .tag_lightweight("v1", &f.git.find_object(id, None).unwrap(), false)
+            .unwrap();
+        let branches = page(&f.root, "/branches", &f.params(""), None).unwrap();
+        let tags = page(&f.root, "/tags", &f.params(""), None).unwrap();
+        assert_eq!(branches.active_tab, Some("Branches"));
+        assert_eq!(tags.active_tab, Some("Tags"));
+        assert!(branches.body.contains(">main</a>"));
+        assert!(!branches.body.contains(">v1</a>"));
+        assert!(tags.body.contains(">v1</a>"));
+        assert!(tags.body.contains(&format!("rev={id}")));
+    }
+
+    #[test]
+    fn browsing_search_and_raw_expose_only_committed_content() {
+        let f = Fixture::new();
+        f.put(b"file.txt", b"original\n");
+        f.put(b"deleted.txt", b"still committed\n");
+        f.stage(b"file.txt");
+        f.stage(b"deleted.txt");
+        f.commit("Initial");
+        f.put(b"file.txt", b"staged\n");
+        f.put(b"staged-only.txt", b"not committed\n");
+        f.stage(b"file.txt");
+        f.stage(b"staged-only.txt");
+        f.put(b"file.txt", b"working\n");
+        f.put(b"untracked.txt", b"private\n");
+        std::fs::remove_file(f.directory.join("demo/deleted.txt")).unwrap();
+        let index = f.directory.join("demo/.git/index");
+        let before = std::fs::read(&index).unwrap();
+        let listing = page(&f.root, "/files", &f.params(""), None).unwrap();
+        assert_eq!(listing.revision, Some(b"refs/heads/main".to_vec()));
+        assert!(listing.body.contains("deleted.txt"));
+        assert!(!listing.body.contains("staged-only.txt"));
+        assert!(!listing.body.contains("untracked.txt"));
+        let source = page(&f.root, "/files", &f.params("path=file.txt"), None).unwrap();
+        assert!(source.body.contains("original"));
+        assert!(!source.body.contains("staged"));
+        assert!(!source.body.contains("working"));
+        assert_eq!(
+            raw(&f.root, &f.params("path=file.txt")).unwrap(),
+            b"original\n"
+        );
+        assert_eq!(
+            raw(&f.root, &f.params("path=deleted.txt")).unwrap(),
+            b"still committed\n"
+        );
+        for name in ["untracked.txt", "staged-only.txt"] {
+            assert_eq!(
+                raw(&f.root, &f.params(&format!("path={name}")))
+                    .err()
+                    .unwrap()
+                    .status,
+                404
+            );
+            assert_eq!(
+                page(&f.root, "/files", &f.params(&format!("path={name}")), None)
+                    .err()
+                    .unwrap()
+                    .status,
+                404
+            );
+            let search = page(&f.root, "/search", &f.params(&format!("q={name}")), None).unwrap();
+            assert!(!search.body.contains(&format!(">{name}<")));
+        }
+        assert_eq!(
+            page(&f.root, "/changes", &f.params(""), None)
+                .err()
+                .unwrap()
+                .status,
+            404
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+    }
+
+    #[test]
+    fn unified_search_preserves_snapshots_and_resets_them_when_switching_repository() {
         let f = Fixture::new();
         f.put(b"file.txt", b"original\n");
         f.stage(b"file.txt");
-        f.commit("Initial");
-        f.put(b"file.txt", b"staged\n");
-        f.stage(b"file.txt");
-        f.put(b"file.txt", b"working\n");
-        f.put(b"new.txt", b"new\n");
-        f.put(b".gitignore", b"secret.txt\n");
-        f.put(b"secret.txt", b"private\n");
-        let index = f.directory.join("demo/.git/index");
-        let before = std::fs::read(&index).unwrap();
-        let page = page(&f.root, "/changes", &f.params(""), None).unwrap();
-        assert!(page.body.contains("<h2>Staged</h2>"));
-        assert!(page.body.contains("+staged\n"));
-        assert!(page.body.contains("+working\n"));
-        assert!(page.body.contains("new.txt"));
-        assert!(!page.body.contains("secret.txt"));
-        assert_eq!(std::fs::read(&index).unwrap(), before);
+        let first = f.commit("Initial");
+        f.put(b"new.txt", b"next\n");
+        f.stage(b"new.txt");
+        f.commit("Add file");
+        let selected = search_scope(b"demo");
+        let search =
+            |query: &str| page(&f.root, "/search", &Params::parse(query).unwrap(), None).unwrap();
+        let names = search("q=demo");
+        assert!(names.body.contains("aria-label=\"Projects\""));
+        assert!(!names.body.contains("aria-label=\"Files\""));
+        let old = search(&format!(
+            "scope={selected}&snapshot_scope={selected}&rev={first}&q=txt"
+        ));
+        assert!(old.body.contains("file.txt</span>"));
+        assert!(!old.body.contains("new.txt</span>"));
+        assert!(old.body.contains(&format!("rev={first}")));
+        let other = Repository::init_bare(f.directory.join("other.git")).unwrap();
+        let tree = other.treebuilder(None).unwrap().write().unwrap();
+        let sig = git2::Signature::now("Terry", "test@example.invalid").unwrap();
+        other
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Other",
+                &other.find_tree(tree).unwrap(),
+                &[],
+            )
+            .unwrap();
+        let changed = search(&format!(
+            "scope={}&snapshot_scope={selected}&rev={first}&q=txt",
+            search_scope(b"other.git")
+        ));
+        assert!(!changed.body.contains(&first.to_string()));
+        assert!(
+            changed.body.contains(
+                std::str::from_utf8(
+                    other
+                        .find_reference("HEAD")
+                        .unwrap()
+                        .symbolic_target_bytes()
+                        .unwrap()
+                )
+                .unwrap()
+            )
+        );
+        assert!(changed.body.contains("No matching files"));
+    }
+
+    #[test]
+    fn unified_search_paginates_with_the_selected_repository_and_commit() {
+        let f = Fixture::new();
+        let mut index = f.git.index().unwrap();
+        for number in 0..=PAGE_SIZE {
+            let name = format!("file-{number:03}.txt");
+            f.put(name.as_bytes(), b"committed\n");
+            index.add_path(path(name.as_bytes())).unwrap();
+        }
+        index.write().unwrap();
+        let id = f.commit("Files");
+        let first = page(
+            &f.root,
+            "/search",
+            &f.params(&format!("q=file-&rev={id}")),
+            None,
+        )
+        .unwrap();
+        let next = first
+            .body
+            .split("href=\"")
+            .skip(1)
+            .map(|value| value.split('"').next().unwrap())
+            .find(|value| value.starts_with("/search?") && value.contains("page=1"))
+            .unwrap()
+            .replace("&amp;", "&")
+            .replace("&#38;", "&");
+        let q = Params::parse(next.split_once('?').unwrap().1).unwrap();
+        assert_eq!(q.bytes("repo"), b"demo");
+        assert_eq!(q.bytes("rev"), id.to_string().as_bytes());
+        let second = page(&f.root, "/search", &q, None).unwrap();
+        assert!(second.body.contains("file-200.txt</span>"));
+        assert!(!second.body.contains("file-000.txt</span>"));
+    }
+
+    #[test]
+    fn repositories_without_commits_do_not_show_disk_files() {
+        let f = Fixture::new();
+        f.put(b"draft.txt", b"private draft\n");
+        let listing = page(&f.root, "/files", &f.params(""), None).unwrap();
+        assert!(listing.body.contains("No commits yet"));
+        assert!(!listing.body.contains("draft.txt"));
         assert_eq!(
-            raw(&f.root, &f.params("path=secret.txt"))
+            page(&f.root, "/files", &f.params("path=draft.txt"), None)
+                .err()
+                .unwrap()
+                .status,
+            404
+        );
+        assert_eq!(
+            raw(&f.root, &f.params("path=draft.txt"))
                 .err()
                 .unwrap()
                 .status,
@@ -1867,22 +1573,26 @@ mod tests {
         f.stage(b"odd\xff.txt");
         let first = f.commit("<script> commit");
         let q = f.params(&format!("rev={first}&path=odd%FF.txt"));
-        match raw(&f.root, &q).unwrap() {
-            Raw::Bytes(bytes) => assert_eq!(bytes, b"<script>alert(1)</script>\n"),
-            _ => panic!("expected stored bytes"),
-        }
+        assert_eq!(raw(&f.root, &q).unwrap(), b"<script>alert(1)</script>\n");
         let listing = page(&f.root, "/files", &f.params(&format!("rev={first}")), None).unwrap();
         assert!(listing.body.contains("odd%FF%2Etxt"));
-        let c = page(&f.root, "/commit", &f.params(&format!("id={first}")), None).unwrap();
-        assert!(c.body.contains("Root commit"));
-        assert!(!c.body.contains("<script>"));
-        assert!(c.body.contains("+&lt;script&gt;"));
+        let history = page(
+            &f.root,
+            "/history",
+            &f.params(&format!("rev={first}")),
+            None,
+        )
+        .unwrap();
+        assert!(!history.body.contains("<script>"));
+        assert!(history.body.contains("&lt;script&gt; commit"));
     }
 
     #[test]
     fn symlink_targets_are_visible_but_not_read() {
         let f = Fixture::new();
         std::os::unix::fs::symlink("/etc/passwd", f.directory.join("demo/link")).unwrap();
+        f.stage(b"link");
+        f.commit("Record link");
         let p = page(&f.root, "/files", &f.params("path=link"), None).unwrap();
         assert!(p.body.contains("Symbolic link (never followed)"));
         assert!(p.body.contains("/etc/passwd"));
@@ -1899,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_filters_are_reported_and_never_executed() {
+    fn committed_reads_ignore_worktree_filters() {
         let f = Fixture::new();
         f.put(b"file.txt", b"first\n");
         f.stage(b"file.txt");
@@ -1911,63 +1621,179 @@ mod tests {
             .unwrap()
             .set_str("filter.evil.clean", &format!("touch {}", marker.display()))
             .unwrap();
-        let p = page(&f.root, "/changes", &f.params(""), None).unwrap();
-        assert!(p.body.contains("No filter is executed"));
+        let p = page(&f.root, "/files", &f.params("path=file.txt"), None).unwrap();
+        assert!(p.body.contains("first"));
+        assert_eq!(
+            raw(&f.root, &f.params("path=file.txt")).unwrap(),
+            b"first\n"
+        );
         assert!(!marker.exists());
     }
 
     #[test]
-    fn compare_uses_endpoint_trees() {
+    fn removed_commit_and_compare_views_return_not_found() {
         let f = Fixture::new();
-        f.put(b"file.txt", b"one\n");
-        f.stage(b"file.txt");
-        let first = f.commit("First");
-        f.put(b"file.txt", b"two\n");
-        f.stage(b"file.txt");
-        let second = f.commit("Second");
-        let p = page(
-            &f.root,
-            "/compare",
-            &f.params(&format!("from={first}&to={second}")),
-            None,
-        )
-        .unwrap();
-        assert!(p.body.contains("-one\n"));
-        assert!(p.body.contains("+two\n"));
-        assert!(p.body.contains(&second.to_string()));
+        for route in ["/commit", "/compare"] {
+            assert_eq!(
+                page(&f.root, route, &f.params(""), None)
+                    .err()
+                    .unwrap()
+                    .status,
+                404
+            );
+        }
     }
 
     #[test]
-    fn working_status_uses_one_pinned_head_and_reports_a_concurrent_move() {
+    fn snapshot_navigation_stays_pinned_when_head_moves() {
         let f = Fixture::new();
         f.put(b"file.txt", b"original\n");
         f.stage(b"file.txt");
         let first = f.commit("First");
-        let repo = repository(&f.root, b"demo").unwrap();
-        let index = index(&repo).unwrap();
-        let tree = repo.git.find_commit(first).unwrap().tree().unwrap();
-        let before = fs::stat(&f.root, b"demo/.git/index").ok();
-
-        // Move only HEAD, as another process can do while this request retains
-        // its original index and HEAD tree. The disk file remains unchanged.
-        let other_blob = f.git.blob(b"another snapshot\n").unwrap();
-        let mut builder = f.git.treebuilder(Some(&tree)).unwrap();
-        builder.insert("file.txt", other_blob, 0o100644).unwrap();
-        let other_tree = f.git.find_tree(builder.write().unwrap()).unwrap();
-        let parent = f.git.find_commit(first).unwrap();
-        let sig = git2::Signature::now("Terry", "test@example.invalid").unwrap();
-        f.git
-            .commit(Some("HEAD"), &sig, &sig, "Moved", &other_tree, &[&parent])
-            .unwrap();
-
-        let st = fs::stat(&f.root, b"demo/file.txt").unwrap();
+        let listing = page(&f.root, "/files", &f.params(&format!("rev={first}")), None).unwrap();
+        f.put(b"file.txt", b"another snapshot\n");
+        f.stage(b"file.txt");
+        f.commit("Moved");
+        assert_eq!(listing.revision, Some(first.to_string().into_bytes()));
+        assert!(listing.body.contains(&format!("rev={first}")));
         assert_eq!(
-            file_status(&f.root, &repo, &index, Some(&tree), b"file.txt", &st).unwrap(),
-            "unchanged"
+            raw(&f.root, &f.params(&format!("path=file.txt&rev={first}"))).unwrap(),
+            b"original\n"
         );
-        let mut notice = String::new();
-        state_notice(&mut notice, &f.root, &repo, before, Some(first));
-        assert!(notice.contains("HEAD or the index changed"));
+        assert_eq!(
+            raw(&f.root, &f.params("path=file.txt")).unwrap(),
+            b"another snapshot\n"
+        );
+    }
+
+    #[test]
+    fn named_selections_survive_all_tabs_files_and_markdown() {
+        let f = Fixture::new();
+        f.put(b"file.txt", b"original version\n");
+        f.put(b"README.md", b"[Open file](file.txt)\n");
+        f.stage(b"file.txt");
+        f.stage(b"README.md");
+        let first = f.commit("First");
+        f.git
+            .tag_lightweight("release", &f.git.find_object(first, None).unwrap(), false)
+            .unwrap();
+        f.put(b"file.txt", b"new version\n");
+        f.stage(b"file.txt");
+        let second = f.commit("Second");
+        f.git
+            .branch("release", &f.git.find_commit(second).unwrap(), false)
+            .unwrap();
+        for selected in ["refs/tags/release", "refs/heads/release"] {
+            for route in ["/files", "/history", "/branches", "/tags"] {
+                let page =
+                    page(&f.root, route, &f.params(&format!("rev={selected}")), None).unwrap();
+                assert_eq!(page.revision.as_deref(), Some(selected.as_bytes()));
+                assert!(page.context.ends_with(">release</span>"));
+                assert!(!page.context.contains("href="));
+                let html = crate::render::layout_page(&page, Some(b"demo"), None).unwrap();
+                for href in html.split("href=\"").skip(1).map(|value| {
+                    value
+                        .split('"')
+                        .next()
+                        .unwrap()
+                        .replace("&amp;", "&")
+                        .replace("&#38;", "&")
+                }) {
+                    assert!(!href.starts_with("/commit?"));
+                    assert!(!href.starts_with("/compare?"));
+                    if href.starts_with("/search?") {
+                        assert_eq!(
+                            Params::parse(href.split_once('?').unwrap().1)
+                                .unwrap()
+                                .bytes("rev"),
+                            selected.as_bytes()
+                        );
+                    }
+                }
+            }
+            let markdown = page(
+                &f.root,
+                "/files",
+                &f.params(&format!("path=README.md&rev={selected}")),
+                None,
+            )
+            .unwrap();
+            assert!(markdown.body.contains(&format!(
+                    "rev={}",
+                    crate::render::url("", &[("rev", selected.as_bytes())])
+                        .split_once('=')
+                        .unwrap()
+                        .1
+                )));
+        }
+        assert_eq!(
+            raw(&f.root, &f.params("path=file.txt&rev=refs/tags/release")).unwrap(),
+            b"original version\n"
+        );
+        assert_eq!(
+            raw(&f.root, &f.params("path=file.txt&rev=refs/heads/release")).unwrap(),
+            b"new version\n"
+        );
+        let default = page(&f.root, "/files", &f.params(""), None).unwrap();
+        assert_eq!(
+            default.revision.as_deref(),
+            Some(b"refs/heads/main".as_slice())
+        );
+    }
+
+    #[test]
+    fn revision_links_keep_the_route_path_filters_and_page() {
+        let f = Fixture::new();
+        std::fs::create_dir(f.directory.join("demo/src")).unwrap();
+        f.put(b"src/file.txt", b"one\n");
+        f.stage(b"src/file.txt");
+        let first = f.commit("First");
+        f.git
+            .tag_lightweight("v1", &f.git.find_object(first, None).unwrap(), false)
+            .unwrap();
+        let original = f.params("path=src&q=file&page=0&source=1&rev=refs/heads/main&extra=a%26b");
+        for (route, text, revision) in [
+            ("/files", "First", first.to_string()),
+            ("/history", "First", first.to_string()),
+            ("/branches", "main", "refs/heads/main".into()),
+            ("/tags", "v1", "refs/tags/v1".into()),
+            ("/refs", "main", "refs/heads/main".into()),
+        ] {
+            let rendered = page(&f.root, route, &original, None).unwrap();
+            let before_text = rendered.body.split(&format!(">{text}</a>")).next().unwrap();
+            let href = before_text
+                .rsplit("href=\"")
+                .next()
+                .unwrap()
+                .trim_end_matches('"')
+                .replace("&amp;", "&")
+                .replace("&#38;", "&");
+            let (target, query) = href.split_once('?').unwrap();
+            assert_eq!(target, route);
+            let selected = Params::parse(query).unwrap();
+            let mut expected = original.clone();
+            expected.0.insert("rev".into(), revision.into_bytes());
+            assert_eq!(selected.0, expected.0);
+        }
+    }
+
+    #[test]
+    fn non_utf8_tag_names_remain_selected_and_readable() {
+        let f = Fixture::new();
+        f.put(b"file.txt", b"one\n");
+        f.stage(b"file.txt");
+        let id = f.commit("First");
+        let tag = f.directory.join("demo/.git/refs/tags");
+        std::fs::create_dir_all(&tag).unwrap();
+        std::fs::write(tag.join(path(b"tag\xff")), format!("{id}\n")).unwrap();
+        let q = f.params("path=file.txt&rev=refs%2Ftags%2Ftag%FF");
+        let selected = page(&f.root, "/files", &q, None).unwrap();
+        assert_eq!(
+            selected.revision.as_deref(),
+            Some(b"refs/tags/tag\xff".as_slice())
+        );
+        assert!(selected.context.contains("tag\\xFF</span>"));
+        assert_eq!(raw(&f.root, &q).unwrap(), b"one\n");
     }
 
     #[test]
