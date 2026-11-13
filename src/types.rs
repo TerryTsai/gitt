@@ -127,12 +127,15 @@ impl Params {
 
 pub struct Page {
     pub title: String,
+    /// Optional application HTML for a linked heading; repository text is escaped.
+    pub heading: Option<String>,
     pub body: String,
 }
 impl Page {
     pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
         Self {
             title: title.into(),
+            heading: None,
             body: body.into(),
         }
     }

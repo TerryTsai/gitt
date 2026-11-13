@@ -453,15 +453,14 @@ fn route(app: &App, path: &str, q: &Params, post: bool) -> Result<Response<Body>
         "/compare" => q.bytes("to"),
         _ => q.bytes("rev"),
     };
-    let document = render::layout_with_revision(
-        &page.title,
+    let document = render::layout_page(
+        &page,
         repo,
         if revision.is_empty() {
             None
         } else {
             Some(revision)
         },
-        &page.body,
     )?;
     if document.len() > types::HTML_LIMIT {
         return Err(AppError::limit(

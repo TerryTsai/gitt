@@ -42,7 +42,7 @@ mkdir -p "$HOME/repositories"
 "$HOME/.local/bin/gitt" "$HOME/repositories"
 ```
 
-Open <http://127.0.0.1:8080>. Use **New repository** to create an empty repository, or put existing repositories in the directory using your normal tools. A structure such as this works:
+Open <http://127.0.0.1:8080>. Use **Create repository** to create an empty repository, or put existing repositories in the directory using your normal tools. A structure such as this works:
 
 ```text
 repositories/
@@ -54,7 +54,9 @@ repositories/
 
 Discovery is recursive and stops at each repository. Symlink directories are skipped. A checkout edited in this directory shows its live files; a clone elsewhere does not appear here. Refresh or follow a link to see updates.
 
-**Files** opens the working files of a checkout or the default branch of a bare repository. **Refs** opens a committed snapshot. **Changes** separates staged, unstaged, and untracked content. **Compare** compares the two selected trees directly. Merge commits show their first-parent diff and all parent IDs.
+Open **Menu** for repository navigation. **Files** opens the working files of a checkout or the default branch of a bare repository. **Branches & tags** opens a committed snapshot. **Changes** separates staged, unstaged, and untracked content. **Compare** compares the two selected trees directly. Merge commits show their first-parent diff and all parent IDs.
+
+On a file page, follow the linked path to its parent directory. Expand **Working tree** or **Snapshot** for repository details and the configured SSH clone URL; use **Raw** to download the file. These compact controls are in the current source and LAN preview; the published v0.1.0 archives use the earlier layout.
 
 For LAN access, explicitly bind a network interface and set the URL people will use:
 
@@ -109,7 +111,7 @@ Highlighting includes Rust, Python, C, C++, JavaScript, JSON, HTML, CSS, shell, 
 
 ## Performance
 
-On an i5-4570T with an SSD, using 300 repositories including one 1 GiB repository:
+Measured for v0.1.0 on an i5-4570T with an SSD, using 300 repositories including one 1 GiB repository:
 
 | Measurement | x86-64 release |
 | --- | --- |

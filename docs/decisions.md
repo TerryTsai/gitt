@@ -8,6 +8,7 @@ The user approved the requirements and technical direction, then authorized impl
 | Evaluate gitoxide, retain git2 for v0.1 | Current gitoxide can handle staged status; it was not rejected for lacking that feature. A second backend would add unproven maintenance cost. |
 | Axum / Hyper / one-thread Tokio runtime | Explicit connection and blocking-work limits. Two active Git/render operations, four waiting operations, 16 connections. No separate worker service. |
 | Askama + embedded CSS/templates | Autoescaped outer document, audited escaped fragments, zero browser JavaScript. |
+| Content-first phone layout | After mobile feedback, put navigation in a native Menu disclosure, combine the repository and path into one linked heading, and place Raw beside an expandable working-tree/snapshot context. Hide the redundant unchanged label; actual changes and limitations stay visible. No new classes, IDs, scripts, or dependencies. |
 | pulldown-cmark + Ammonia | Restricted Markdown; repository HTML is displayed as text. Images become alt text. Relative links stay within the selected repository snapshot. |
 | syntect, per-language compiled packs with Oniguruma | The preferred pure-Rust fancy-regex backend retained 23–28 MiB with concurrent source requests, exceeding the unchanged 16 MiB idle target. Curated packs alone did not fix it. Bundled Oniguruma brought the measured source-only retained RSS below 8 MiB, with complete highlighting of the 64 KiB fixture. YAML grammar compilation runs at build time; each request loads only its language and dependencies. Plain text remains available. |
 | Linux Landlock ABI ≥3 and openat2 required | Kernel confinement applies to library reads too. Startup fails if enforcement is unavailable. The development host has ABI 2, so runtime acceptance testing occurs on the target host. |
@@ -32,3 +33,7 @@ A 24 MiB shared native allocation budget additionally bounds libgit2 malloc/real
 All browser form contexts preserve non-UTF-8 filename bytes using internal hexadecimal hidden fields; navigation URLs use percent-encoded original bytes. Markdown is limited to 40,000 events and 128 nested elements.
 
 Oniguruma is initialized before threads with 16,384 match-stack entries and one million match/search retries, in addition to the per-file size, line-length, and cooperative time limits. The C regex backend is an explicit measured tradeoff against the initial pure-Rust preference; it adds no runtime library dependency. Full release workload measurements are recorded separately in performance.md.
+
+Mobile density is checked explicitly: the first code line on `tests/smoke.py` must start within 180 CSS pixels of the document top at 360 and 390 pixel widths, with default disclosures closed. Source stays at 14 px with 22.4 px line spacing. Long paths and branch names may wrap; warnings and actual changes may add rows. Menu and context disclosures, search, and raw-download controls retain 44 px touch heights.
+
+The stylesheet URL includes a hash of its embedded contents so an updated executable does not reuse a previous build's hour-long CSS cache.

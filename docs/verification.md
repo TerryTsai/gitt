@@ -42,8 +42,37 @@ of running gitt.
 Browser checks reject scripts, external resource requests, unexpected classes or
 IDs, missing labels, and page-wide overflow. They exercise repository/path search,
 Markdown/source navigation, line links, refresh, and revision-preserving links.
-Code is allowed to scroll horizontally. The README screenshots are captures from
-this verified binary, not mockups.
+Code is allowed to scroll horizontally. The README screenshots are real browser
+captures, updated for the mobile layout follow-up below.
+
+## Mobile layout follow-up — 2026-11-13
+
+The first version fitted a phone viewport but placed too much navigation and
+repeated metadata above the code. The revised layout uses native disclosures,
+one linked path heading, inline file actions, and compact search forms.
+
+Measured on `tests/smoke.py`, with JavaScript disabled in Chromium 149:
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| First code line, 360 and 390 px widths | 490.77 px | 147 px |
+| Complete visible lines, 360×800 | 13 | 29 |
+| Complete visible lines, 390×844 | 15 | 31 |
+| Header height | 181.8 px | 45 px |
+| Source font / line spacing | 14 / 22.4 px | 14 / 22.4 px |
+
+The follow-up passed 21 unit tests, formatting/Clippy, 15 HTTP smoke cases
+(the optional 1 GiB case was not repeated), 48 route/viewport browser checks,
+and both native-menu navigation workflows. Six additional profiles cover
+360, 390, and 1280 px widths in light and dark modes, including open disclosures,
+parent links, raw downloads, snapshot navigation, and long paths. Main disclosure
+and action controls retain 44 px touch heights. The stylesheet URL includes its
+content hash so existing browser caches receive the new layout.
+
+These are browser viewport measurements; phone browser chrome is not included.
+WebKit could not launch on the test host because its required system libraries
+are missing, so this follow-up does not claim a Safari or physical-device test.
+The v0.1.0 resource measurements above were not rerun for this presentation change.
 
 ## Reproduction
 

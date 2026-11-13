@@ -12,13 +12,14 @@ use std::{
 use askama::Template;
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use sha2::{Digest, Sha256};
 use syntect::{
     html::{ClassStyle, line_tokens_to_classed_spans},
     parsing::{ParseState, ScopeStack, SyntaxSet},
     util::LinesWithEndings,
 };
 
-use crate::types::{AppError, HTML_LIMIT, Result, TEXT_LIMIT};
+use crate::types::{AppError, HTML_LIMIT, Page, Result, TEXT_LIMIT};
 
 pub const CSS: &str = include_str!("../static/style.css");
 const LINE_LIMIT: usize = 20_000;
@@ -139,6 +140,8 @@ struct Tab {
 #[template(path = "layout.html")]
 struct Layout<'a> {
     title: &'a str,
+    heading: String,
+    stylesheet: &'static str,
     repo_name: String,
     tabs: Vec<Tab>,
     body: &'a str,
@@ -152,6 +155,26 @@ pub fn layout(title: &str, repo: Option<&[u8]>, body: &str) -> Result<String> {
 /// Keep an explicitly selected snapshot when moving between Files and History.
 pub fn layout_with_revision(
     title: &str,
+    repo: Option<&[u8]>,
+    revision: Option<&[u8]>,
+    body: &str,
+) -> Result<String> {
+    layout_document(title, None, repo, revision, body)
+}
+
+pub fn layout_page(page: &Page, repo: Option<&[u8]>, revision: Option<&[u8]>) -> Result<String> {
+    layout_document(
+        &page.title,
+        page.heading.as_deref(),
+        repo,
+        revision,
+        &page.body,
+    )
+}
+
+fn layout_document(
+    title: &str,
+    heading: Option<&str>,
     repo: Option<&[u8]>,
     revision: Option<&[u8]>,
     body: &str,
@@ -184,12 +207,18 @@ pub fn layout_with_revision(
             .collect()
         })
         .unwrap_or_default();
+    let title = if title.is_empty() {
+        "Repository"
+    } else {
+        title
+    };
+    // A new embedded stylesheet must not reuse an earlier build's cached URL.
+    static STYLESHEET: OnceLock<String> = OnceLock::new();
     let page = Layout {
-        title: if title.is_empty() {
-            "Repository"
-        } else {
-            title
-        },
+        title,
+        heading: heading.map(str::to_owned).unwrap_or_else(|| escape(title)),
+        stylesheet: STYLESHEET
+            .get_or_init(|| format!("/style.css?v={:x}", Sha256::digest(CSS.as_bytes()))),
         repo_name: repo
             .map(|repo| {
                 if repo.is_empty() {

@@ -5,7 +5,7 @@ Generate fixtures with `scripts/fixtures.py --security` and run gitt against the
 machine; they are development tools and are not part of the application.
 
 This command checks 24 routes at both 360×800 and 1280×900 pixels and runs the
-repository-search, path-search, source, line-link, refresh, Markdown-link, and
+repository-search, path-search, source, line-link, native-menu, refresh, Markdown-link, and
 snapshot-navigation workflow at both sizes. Browser JavaScript is disabled in
 all test contexts. Playwright's own inspection code reads the DOM and layout.
 
@@ -53,3 +53,11 @@ and failures; screenshots show a real source page. Unexpected external requests,
 script elements, event handlers, inline styles, non-syntax classes, non-line IDs,
 missing labels, and page-wide horizontal overflow fail the check. Scrolling inside
 code blocks is allowed.
+
+The report also records the source pane position, first code line position, and
+complete visible line count. Set `GITT_MAX_CODE_TOP=180` with a representative
+source screenshot route to fail if its first line starts more than 180 CSS pixels
+below the document top. This checks useful content density in addition to fitting
+the viewport. Use an ordinary path without extra change/limit notices; long names
+and warnings are intentionally allowed to add height. The native Menu is opened
+before navigation actions, still with browser JavaScript disabled.

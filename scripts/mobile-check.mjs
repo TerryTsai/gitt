@@ -12,10 +12,44 @@ const routes = JSON.parse(process.env.GITT_ROUTES || '["/", "/new", "/help"]')
   .map(route => typeof route === 'string' ? { path: route, status: 200 } : route);
 const screenshotRoute = process.env.GITT_SCREENSHOT_ROUTE || routes.find(route => route.path.startsWith('/files'))?.path || '/';
 const output = resolve(process.env.GITT_ARTIFACT_DIR || `/tmp/gitt-ui-${Date.now()}`);
+const maxCodeTop = process.env.GITT_MAX_CODE_TOP === undefined ? null : Number(process.env.GITT_MAX_CODE_TOP);
+assert(maxCodeTop === null || (Number.isFinite(maxCodeTop) && maxCodeTop > 0), 'GITT_MAX_CODE_TOP must be a positive pixel value');
 await mkdir(output, { recursive: true });
 
 const browser = await chromium.launch({ headless: true });
-const report = { base: base.origin, generated: new Date().toISOString(), javaScriptEnabled: false, pages: [], workflows: [], screenshots: [], failures: [] };
+const report = { base: base.origin, generated: new Date().toISOString(), javaScriptEnabled: false, maxCodeTop, pages: [], workflows: [], screenshots: [], screenshotMetrics: [], failures: [] };
+
+async function sourcePosition(page) {
+  return page.evaluate(() => {
+    const pane = document.querySelector('pre[aria-label="File contents"]');
+    const lines = pane ? [...pane.querySelectorAll('code a[id]')] : [];
+    const documentTop = element => element ? Math.round((element.getBoundingClientRect().top + window.scrollY) * 100) / 100 : null;
+    const completelyVisible = lines.filter(element => {
+      const box = element.getBoundingClientRect();
+      return box.top >= 0 && box.bottom <= window.innerHeight;
+    });
+    const partlyVisible = lines.filter(element => {
+      const box = element.getBoundingClientRect();
+      return box.top < window.innerHeight && box.bottom > 0;
+    });
+    return {
+      codePaneTop: documentTop(pane),
+      firstCodeLineTop: documentTop(lines[0]),
+      completeVisibleLines: completelyVisible.length,
+      visibleLines: partlyVisible.length,
+      firstVisibleLine: partlyVisible[0]?.id ?? null,
+      lastVisibleLine: partlyVisible.at(-1)?.id ?? null,
+    };
+  });
+}
+
+async function openHeaderMenu(page) {
+  const menu = page.locator('header > details').first();
+  if (!await menu.count()) return false;
+  if (await menu.getAttribute('open') === null) await menu.locator(':scope > summary').click();
+  assert.notEqual(await menu.getAttribute('open'), null, 'The native header menu must open with JavaScript disabled');
+  return true;
+}
 
 try {
   for (const [name, viewport] of [['mobile', { width: 360, height: 800 }], ['desktop', { width: 1280, height: 900 }]]) {
@@ -63,7 +97,12 @@ try {
           }
           const overflow = document.documentElement.scrollWidth - window.innerWidth;
           if (overflow > 1) failures.push(`Page overflows horizontally by ${overflow}px`);
-          const protruding = all.filter(element => !element.closest('pre')).filter(element => {
+          const closedDetails = [...document.querySelectorAll('details:not([open])')];
+          const concealedByDetails = element => closedDetails.some(details =>
+            details !== element && details.contains(element) && !details.querySelector(':scope > summary')?.contains(element)
+          );
+          // Chromium may return phantom boxes for descendants of closed details.
+          const protruding = all.filter(element => !element.closest('pre') && !concealedByDetails(element)).filter(element => {
             const box = element.getBoundingClientRect();
             return box.width && (box.right > window.innerWidth + 1 || box.left < -1);
           }).map(element => `${element.tagName}: ${element.textContent.slice(0, 100)}`);
@@ -73,7 +112,8 @@ try {
           if (document.querySelectorAll('img, video, audio, source').length) failures.push('Repository content must not load embedded media');
           return { failures, title: document.title, width: window.innerWidth, documentWidth: document.documentElement.scrollWidth, sourceLines: document.querySelectorAll('pre code a[id]').length, syntaxTokens: document.querySelectorAll('pre code span[class]').length, links: document.links.length };
         });
-        const result = { viewport: name, route, status: response?.status(), elapsedMs: Math.round(performance.now() - started), ...checks };
+        const position = await sourcePosition(page);
+        const result = { viewport: name, route, status: response?.status(), elapsedMs: Math.round(performance.now() - started), ...checks, ...position };
         report.pages.push(result);
         if (response?.status() !== expectedStatus) report.failures.push(`${name} ${route}: expected HTTP ${expectedStatus}, got ${response?.status()}`);
         for (const failure of checks.failures) report.failures.push(`${name} ${route}: ${failure}`);
@@ -85,6 +125,7 @@ try {
     if (process.env.GITT_WORKFLOW_REPO) {
       const repo = process.env.GITT_WORKFLOW_REPO;
       const path = (route, values) => new URL(`${route}?${new URLSearchParams({ repo, ...values })}`, base).href;
+      let nativeMenu = false;
       try {
         await page.goto(base.href);
         await page.getByLabel('Repository name', { exact: true }).fill(repo);
@@ -98,6 +139,7 @@ try {
         assert.equal(new URL(page.url()).searchParams.get('path'), 'src/main.rs');
         await page.getByRole('link', { name: 'Line 2', exact: true }).click();
         assert.equal(new URL(page.url()).hash, '#L2');
+        nativeMenu = await openHeaderMenu(page) || nativeMenu;
         await page.getByRole('link', { name: 'Refresh', exact: true }).click();
         assert.equal(new URL(page.url()).searchParams.get('path'), 'src/main.rs');
         await page.goto(path('/files', { path: 'README.md', rev: 'main' }));
@@ -105,11 +147,13 @@ try {
         assert.equal(new URL(page.url()).searchParams.get('path'), 'src/main.rs');
         assert(new URL(page.url()).searchParams.get('rev'), 'Markdown links must preserve their pinned snapshot');
         const snapshot = new URL(page.url()).searchParams.get('rev');
+        nativeMenu = await openHeaderMenu(page) || nativeMenu;
         await page.getByRole('link', { name: 'History', exact: true }).click();
         assert.equal(new URL(page.url()).searchParams.get('rev'), snapshot, 'History tab must preserve the selected snapshot');
+        nativeMenu = await openHeaderMenu(page) || nativeMenu;
         await page.getByRole('link', { name: 'Files', exact: true }).click();
         assert.equal(new URL(page.url()).searchParams.get('rev'), snapshot, 'Files tab must preserve the selected snapshot');
-        report.workflows.push({ viewport: name, repositorySearch: true, pathSearch: true, lineLink: true, refresh: true, markdownLink: true, snapshotNavigation: true });
+        report.workflows.push({ viewport: name, nativeMenu, repositorySearch: true, pathSearch: true, lineLink: true, refresh: true, markdownLink: true, snapshotNavigation: true });
       } catch (error) {
         report.failures.push(`${name} native navigation workflow: ${error.message}`);
       }
@@ -117,6 +161,11 @@ try {
 
     // A representative source view is captured from real server-rendered HTML.
     await page.goto(new URL(screenshotRoute, base).href, { waitUntil: 'networkidle' });
+    const position = await sourcePosition(page);
+    report.screenshotMetrics.push({ viewport: name, route: screenshotRoute, ...position });
+    if (maxCodeTop !== null && (position.firstCodeLineTop === null || position.firstCodeLineTop > maxCodeTop)) {
+      report.failures.push(`${name} ${screenshotRoute}: first code line is ${position.firstCodeLineTop ?? 'missing'}, expected at most ${maxCodeTop}px from document top`);
+    }
     const screenshot = join(output, `${name}.png`);
     await page.screenshot({ path: screenshot, fullPage: true });
     report.screenshots.push(screenshot);

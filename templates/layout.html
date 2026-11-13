@@ -5,12 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>{{ title }} · gitt</title>
-<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="{{ stylesheet }}">
 </head>
 <body>
 <header>
-<nav aria-label="Site">
 <a href="/"><strong>gitt</strong></a>
+<details>
+<summary>Menu</summary>
+<nav aria-label="Site">
 <a href="/">Repositories</a>
 <a href="/new">Create repository</a>
 </nav>
@@ -21,9 +23,10 @@
 <a href="">Refresh</a>
 </nav>
 {% endif %}
+</details>
 </header>
 <main>
-<h1>{{ title }}</h1>
+<h1>{{ heading|safe }}</h1>
 {{ body|safe }}
 </main>
 <footer>

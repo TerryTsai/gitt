@@ -423,7 +423,7 @@ fn repositories(root: &Root, q: &Params) -> Result<Page> {
         .collect();
     let current = q.page()?;
     let mut body = format!(
-        "<p>Browse code and create empty repositories.</p><form method=\"get\" action=\"/\"><label>Repository name <input type=\"search\" name=\"q\" value=\"{}\"></label><button type=\"submit\">Find</button></form><p>{} · {}</p>",
+        "<form role=\"search\" method=\"get\" action=\"/\"><label>Repository name <input type=\"search\" name=\"q\" value=\"{}\"></label><button type=\"submit\">Find</button></form><p>{} · {}</p>",
         label(q.bytes("q")),
         a("/new", &[], "Create repository"),
         a("/", &[("q", q.bytes("q"))], "Refresh")
@@ -501,20 +501,81 @@ fn working_path(root: &Root, repo: &Repo, index: &Index, relative: &[u8]) -> Res
     Ok(fs::join(&repo.relative, relative))
 }
 
-fn breadcrumbs(body: &mut String, repo: &[u8], relative: &[u8], revision: &[u8]) {
-    body.push_str("<nav aria-label=\"Path\">");
-    body.push_str(&a("/files", &[("repo", repo), ("rev", revision)], "Root"));
+fn file_heading(repo: &[u8], relative: &[u8], revision: &[u8]) -> String {
+    let mut heading = a(
+        "/files",
+        &[("repo", repo), ("rev", revision)],
+        &if repo.is_empty() {
+            ".".into()
+        } else {
+            display(repo)
+        },
+    );
     let mut prefix = Vec::new();
     for segment in relative.split(|b| *b == b'/').filter(|s| !s.is_empty()) {
         prefix = fs::join(&prefix, segment);
-        body.push_str(" / ");
-        body.push_str(&a(
-            "/files",
-            &[("repo", repo), ("path", &prefix), ("rev", revision)],
-            &display(segment),
-        ));
+        heading.push_str(" / ");
+        if prefix == relative {
+            heading.push_str(&label(segment));
+        } else {
+            heading.push_str(&a(
+                "/files",
+                &[("repo", repo), ("path", &prefix), ("rev", revision)],
+                &display(segment),
+            ));
+        }
     }
-    body.push_str("</nav>");
+    heading
+}
+
+fn file_context(
+    repo: &Repo,
+    q: &Params,
+    ssh: Option<&str>,
+    working: bool,
+    revision: &[u8],
+    actions: &str,
+) -> String {
+    let mut body = String::from("<aside aria-label=\"File context\"><details><summary>");
+    if working {
+        body.push_str("Working tree · ");
+        if let Ok(head) = repo.git.head() {
+            if repo.git.head_detached().unwrap_or(false) {
+                body.push_str("detached HEAD");
+            } else {
+                body.push_str(&label(head.shorthand_bytes()));
+            }
+        } else {
+            body.push_str("no commits");
+        }
+    } else {
+        body.push_str("Snapshot · ");
+        body.push_str(&label(&revision[..revision.len().min(12)]));
+    }
+    body.push_str("</summary>");
+    body.push_str(&header(repo, q, ssh));
+    if working {
+        body.push_str("<p>Current files on disk. Ignored untracked files are hidden.</p>");
+    } else {
+        let _ = write!(body, "<p>Commit <code>{}</code></p>", label(revision));
+        if !repo.git.is_bare() {
+            let _ = write!(
+                body,
+                "<p>{}</p>",
+                a(
+                    "/files",
+                    &[("repo", &repo.relative)],
+                    "Browse current working tree"
+                )
+            );
+        }
+    }
+    body.push_str("</details>");
+    if !actions.is_empty() {
+        let _ = write!(body, "<nav aria-label=\"File actions\">{actions}</nav>");
+    }
+    body.push_str("</aside>");
+    body
 }
 
 struct FileEntry {
@@ -664,7 +725,7 @@ fn directory_html(
     let relative = q.bytes("path");
     let _ = write!(
         body,
-        "<form method=\"get\" action=\"/files\">{}{}{}<label>Find a path <input type=\"search\" name=\"q\" value=\"{}\"></label><button type=\"submit\">Find</button></form>",
+        "<form role=\"search\" method=\"get\" action=\"/files\">{}{}{}<label>Find a path <input type=\"search\" name=\"q\" value=\"{}\"></label><button type=\"submit\">Find</button></form>",
         hidden("repo", &repo.relative),
         hidden("path", relative),
         hidden("rev", revision),
@@ -718,16 +779,13 @@ fn directory_html(
 fn files(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page> {
     let relative = q.bytes("path");
     fs::valid(relative)?;
-    let mut body = header(repo, q, ssh);
+    let mut body = String::new();
     let mut revision = q.bytes("rev").to_vec();
     let working = revision.is_empty() && !repo.git.is_bare();
     let query = q.text("q")?.to_lowercase();
     let mut content = None;
     let mut working_state = None;
     if working {
-        body.push_str(
-            "<p>Working tree: current files on disk. Ignored untracked files are hidden.</p>",
-        );
         let before = fs::stat(root, &fs::join(&repo.gitdir, b"index")).ok();
         let index = index(repo)?;
         let head = head_commit(&repo.git)?;
@@ -735,7 +793,6 @@ fn files(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page
         let tree = head.as_ref().map(|c| c.tree()).transpose()?;
         let full = working_path(root, repo, &index, relative)?;
         let st = fs::stat(root, &full)?;
-        breadcrumbs(&mut body, &repo.relative, relative, b"");
         if fs::is_dir(&st) {
             let (entries, incomplete) =
                 list_working(root, repo, &index, tree.as_ref(), relative, &query)?;
@@ -746,30 +803,15 @@ fn files(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page
                 "<p>Symbolic link (never followed): <code>{}</code></p>",
                 label(&fs::link(root, &full)?)
             );
-            let _ = write!(
-                body,
-                "<p>{}</p>",
-                escape(&file_status(
-                    root,
-                    repo,
-                    &index,
-                    tree.as_ref(),
-                    relative,
-                    &st
-                )?)
-            );
+            let status = file_status(root, repo, &index, tree.as_ref(), relative, &st)?;
+            if status != "unchanged" {
+                let _ = write!(body, "<p>{}</p>", escape(&status));
+            }
         } else if fs::is_file(&st) {
-            body.push_str(&format!(
-                "<p>{}</p>",
-                escape(&file_status(
-                    root,
-                    repo,
-                    &index,
-                    tree.as_ref(),
-                    relative,
-                    &st
-                )?)
-            ));
+            let status = file_status(root, repo, &index, tree.as_ref(), relative, &st)?;
+            if status != "unchanged" {
+                let _ = write!(body, "<p>{}</p>", escape(&status));
+            }
             content = Some(fs::read(root, &full, TEXT_LIMIT));
         } else {
             return Err(AppError::limit(
@@ -780,24 +822,13 @@ fn files(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page
         let snapshot = match commit(&repo.git, &revision) {
             Ok(c) => c,
             Err(_) if revision.is_empty() && repo.git.head().is_err() => {
+                body.push_str(&header(repo, q, ssh));
                 body.push_str("<p>This repository has no commits yet. Push a branch using SSH to begin browsing.</p>");
                 return finish(display(&repo.relative), body);
             }
             Err(e) => return Err(e),
         };
         revision = snapshot.id().to_string().into_bytes();
-        let _ = write!(body, "<p>Snapshot <code>{}</code></p>", label(&revision));
-        if !repo.git.is_bare() {
-            body.push_str(&format!(
-                "<p>{}</p>",
-                a(
-                    "/files",
-                    &[("repo", &repo.relative)],
-                    "Browse current working tree"
-                )
-            ));
-        }
-        breadcrumbs(&mut body, &repo.relative, relative, &revision);
         let tree = snapshot.tree()?;
         if relative.is_empty() {
             let (entries, incomplete) = list_tree(&repo.git, &tree, b"", &query)?;
@@ -829,20 +860,19 @@ fn files(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page
             }
         }
     }
+    let mut actions = String::new();
     if let Some(bytes) = content {
         let args = [
             ("repo", repo.relative.as_slice()),
             ("path", relative),
             ("rev", revision.as_slice()),
         ];
-        body.push_str("<p>");
-        body.push_str(&a("/raw", &args, "Download raw"));
+        actions.push_str(&a("/raw", &args, "Raw"));
         let markdown = is_markdown(relative);
         if markdown {
             let mut source = args.to_vec();
             source.push(("source", if q.flag("source") { b"0" } else { b"1" }));
-            body.push_str(" · ");
-            body.push_str(&a(
+            actions.push_str(&a(
                 "/files",
                 &source,
                 if q.flag("source") {
@@ -852,7 +882,6 @@ fn files(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page
                 },
             ));
         }
-        body.push_str("</p>");
         match bytes {
             Ok(bytes) => body.push_str(&file_content_with_context(
                 relative,
@@ -867,14 +896,17 @@ fn files(root: &Root, repo: &Repo, q: &Params, ssh: Option<&str>) -> Result<Page
     if let Some((before, head)) = working_state {
         state_notice(&mut body, root, repo, before, head);
     }
-    finish(
+    body.insert_str(0, &file_context(repo, q, ssh, working, &revision, &actions));
+    let mut page = finish(
         if relative.is_empty() {
             display(&repo.relative)
         } else {
             format!("{} — {}", display(relative), display(&repo.relative))
         },
         body,
-    )
+    )?;
+    page.heading = Some(file_heading(&repo.relative, relative, &revision));
+    Ok(page)
 }
 fn is_markdown(path: &[u8]) -> bool {
     let text = display(path).to_ascii_lowercase();
