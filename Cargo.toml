@@ -1,9 +1,10 @@
 [package]
 name = "gitt"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A small, standalone Git browser for your own repositories"
+description = "A web interface for browsing Git repositories"
+repository = "https://github.com/TerryTsai/gitt"
 license = "MIT"
 
 [dependencies]
