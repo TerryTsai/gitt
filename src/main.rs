@@ -16,11 +16,30 @@ use sha2::Sha256;
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Semaphore;
 use types::{AppError, Params, Result};
+
+const ACTIVE_JOBS: usize = 2;
+const ADMITTED_JOBS: usize = 6;
+const QUEUE_WAIT: Duration = Duration::from_secs(2);
+const PAGE_WAIT: Duration = Duration::from_secs(10);
+static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+
+fn http_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        // A slow Git job must leave capacity for another page. All file content,
+        // including raw downloads, now comes from committed Git objects.
+        .max_blocking_threads(ACTIVE_JOBS)
+        .thread_keep_alive(Duration::from_secs(2))
+        .build()
+}
 
 struct Config {
     root: PathBuf,
@@ -57,11 +76,7 @@ fn run() -> Result<()> {
     let listener = std::net::TcpListener::bind(config.bind)?;
     listener.set_nonblocking(true)?;
     let abi = root.confine()?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .max_blocking_threads(2)
-        .thread_keep_alive(Duration::from_secs(2))
-        .build()?;
+    let runtime = http_runtime()?;
     eprintln!(
         "gitt {} listening on {} (Landlock ABI {abi})",
         env!("CARGO_PKG_VERSION"),
@@ -71,8 +86,8 @@ fn run() -> Result<()> {
         root,
         config,
         secret,
-        jobs: Arc::new(Semaphore::new(2)),
-        queue: Arc::new(Semaphore::new(6)),
+        jobs: Arc::new(Semaphore::new(ACTIVE_JOBS)),
+        queue: Arc::new(Semaphore::new(ADMITTED_JOBS)),
     });
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -313,55 +328,108 @@ async fn handle(State(app): State<Arc<App>>, request: Request<Body>) -> Response
             );
         }
     }
+    let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+    // Log route names only: never CSRF tokens, search text, or repository paths.
+    let logged_route = match path.as_str() {
+        "/" => "/",
+        "/search" => "/search",
+        "/files" => "/files",
+        "/raw" => "/raw",
+        "/history" => "/history",
+        "/refs" => "/refs",
+        "/branches" => "/branches",
+        "/tags" => "/tags",
+        "/new" => "/new",
+        "/help" => "/help",
+        _ => "other",
+    };
+    let started = Instant::now();
     let queue = match app.queue.clone().try_acquire_owned() {
         Ok(p) => p,
-        Err(_) => return busy(),
+        Err(_) => {
+            eprintln!("request={request_id} route={logged_route} queue=full");
+            return busy();
+        }
     };
-    let permit =
-        match tokio::time::timeout(Duration::from_secs(10), app.jobs.clone().acquire_owned()).await
-        {
-            Ok(Ok(p)) => p,
-            _ => return busy(),
-        };
+    let permit = match tokio::time::timeout(QUEUE_WAIT, app.jobs.clone().acquire_owned()).await {
+        Ok(Ok(p)) => p,
+        _ => {
+            eprintln!(
+                "request={request_id} route={logged_route} queue=timeout elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            return busy();
+        }
+    };
     let is_head = method == axum::http::Method::HEAD;
     let is_creation = method == axum::http::Method::POST;
-    let job = tokio::task::spawn_blocking(move || {
+    let mut job = tokio::task::spawn_blocking(move || {
         let (_queue, _permit) = (queue, permit);
+        let queue_ms = started.elapsed().as_millis();
+        let work_started = Instant::now();
         let result = route(&app, &path, &q, method == axum::http::Method::POST);
-        result.unwrap_or_else(|e| {
-            if path == "/files" && e.status == 422 && !q.bytes("path").is_empty() {
-                let args: Vec<(&str,&[u8])> = q.0.iter().filter(|(k,_)| k.as_str() != "source").map(|(k,v)|(k.as_str(),v.as_slice())).collect();
-                let mut source_args=args.clone(); source_args.push(("source",b"1"));
-                let message=format!("<p>{}</p><p><a href=\"{}\">Download raw file</a> · <a href=\"{}\">View source</a></p>",render::escape(&e.message),render::escape(&render::url("/raw",&args)),render::escape(&render::url("/files",&source_args)));
-                return html(422,render::layout("Preview unavailable",Some(q.bytes("repo")),&message).unwrap_or_default());
-            }
-            error_response(e,if matches!(path.as_str(),"/files"|"/refs"|"/history"|"/commit"|"/compare"|"/changes"|"/raw"){Some(q.bytes("repo"))}else{None})
-        })
+        let response = result.unwrap_or_else(|e| view_error(e, &path, &q));
+        if started.elapsed() >= Duration::from_millis(500) {
+            eprintln!(
+                "request={request_id} route={logged_route} status={} queue_ms={queue_ms} work_ms={}",
+                response.status().as_u16(),
+                work_started.elapsed().as_millis()
+            );
+        }
+        response
     });
-    match tokio::time::timeout(Duration::from_secs(30), job).await {
+    let wait = if is_creation {
+        Duration::from_secs(30)
+    } else {
+        PAGE_WAIT
+    };
+    match tokio::time::timeout(wait, &mut job).await {
         Ok(Ok(mut response)) => {
             if is_head {
                 *response.body_mut() = Body::empty();
             }
             response
         }
-        _ if is_creation => error_response(
-            AppError::new(
-                503,
-                "The creation response timed out. Creation may still finish; check the repository listing before retrying. Existing destinations will not be overwritten.",
-            ),
-            None,
-        ),
-        _ => busy(),
+        failed => {
+            // Abort prevents a not-yet-started pool job from doing stale work.
+            // Native calls already running retain their permits until they end.
+            job.abort();
+            eprintln!(
+                "request={request_id} route={logged_route} {} elapsed_ms={}",
+                if failed.is_err() {
+                    "response=timeout"
+                } else {
+                    "worker=failed"
+                },
+                started.elapsed().as_millis()
+            );
+            if is_creation {
+                error_response(
+                    AppError::new(
+                        503,
+                        "The creation response timed out. Creation may still finish; check the repository listing before retrying. Existing destinations will not be overwritten.",
+                    ),
+                    None,
+                )
+            } else {
+                error_response(
+                    AppError::new(
+                        503,
+                        "This view took too long to load. Try a narrower path or a different view.",
+                    ),
+                    None,
+                )
+            }
+        }
     }
 }
 fn route(app: &App, path: &str, q: &Params, post: bool) -> Result<Response<Body>> {
     if path == "/new" {
         if post {
-            let bare = match q.text("kind")? {
-                "bare" => true,
-                "checkout" => false,
-                _ => return Err(AppError::bad("Choose bare or checkout.")),
+            let bare = match q.bytes("bare") {
+                b"1" => true,
+                b"" => false,
+                _ => return Err(AppError::bad("Invalid Bare option.")),
             };
             let branch = if q.bytes("branch").is_empty() {
                 &app.config.branch
@@ -384,11 +452,13 @@ fn route(app: &App, path: &str, q: &Params, post: bool) -> Result<Response<Body>
         }
         let token = csrf(app)?;
         let body = format!(
-            "<p>Create an empty repository. Existing paths are never overwritten.</p><form method=\"post\" action=\"/new\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><p><label>Repository path <input name=\"path\" required maxlength=\"1024\" placeholder=\"team/project\" autocomplete=\"off\"></label></p><p><label>Kind <select name=\"kind\"><option value=\"bare\">Bare — push over SSH</option><option value=\"checkout\">Checkout — work directly on disk</option></select></label></p><p><label>Initial branch <input name=\"branch\" required value=\"{}\"></label></p><p>SSH transport and filesystem access are managed on the host. Pushing to a checkout’s checked-out branch follows Git’s normal refusal policy.</p><button type=\"submit\">Create repository</button></form>",
+            "<form method=\"post\" action=\"/new\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><label>Name<input name=\"path\" required maxlength=\"1024\" autocomplete=\"off\"></label><label>Initial branch<input name=\"branch\" required value=\"{}\"></label><label><input type=\"checkbox\" name=\"bare\" value=\"1\" checked> Bare</label><button type=\"submit\">Create repository</button></form>",
             render::escape(&token),
             render::escape(&app.config.branch)
         );
-        let mut result = html(200, render::layout("New repository", None, &body)?);
+        let mut page = types::Page::new("Create", body);
+        page.show_heading = false;
+        let mut result = html(200, render::layout_page(&page, None, None)?);
         let cookie = format!(
             "gitt_csrf={token}; Path=/new; HttpOnly; SameSite=Strict; Max-Age=3600{}",
             if app.config.origin.starts_with("https:") {
@@ -410,13 +480,7 @@ fn route(app: &App, path: &str, q: &Params, post: bool) -> Result<Response<Body>
     }
     if path == "/raw" {
         let data = git::raw(&app.root, q)?;
-        let body = match data {
-            git::Raw::Bytes(b) => Body::from(b),
-            git::Raw::File(f) => Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
-                tokio::fs::File::from_std(f),
-                16384,
-            )),
-        };
+        let body = Body::from(data);
         let mut result = response(200, "application/octet-stream", body);
         let filename = render::display(
             q.bytes("path")
@@ -438,21 +502,33 @@ fn route(app: &App, path: &str, q: &Params, post: bool) -> Result<Response<Body>
     }
     if !matches!(
         path,
-        "/" | "/files" | "/refs" | "/history" | "/commit" | "/compare" | "/changes"
+        "/" | "/search" | "/files" | "/refs" | "/branches" | "/tags" | "/history"
     ) {
         return Err(AppError::new(404, "Page not found."));
     }
+    if path == "/search" {
+        let canonical = git::search_params(q)?;
+        if canonical.0 != q.0 {
+            let args: Vec<_> = canonical
+                .0
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_slice()))
+                .collect();
+            let mut result = response(303, "text/plain; charset=utf-8", Body::empty());
+            result.headers_mut().insert(
+                header::LOCATION,
+                render::url("/search", &args).parse().unwrap(),
+            );
+            return Ok(result);
+        }
+    }
     let page = git::page(&app.root, path, q, app.config.ssh_prefix.as_deref())?;
-    let repo = if path == "/" {
+    let repo = if matches!(path, "/" | "/search") {
         None
     } else {
         Some(q.bytes("repo"))
     };
-    let revision = match path {
-        "/commit" => q.bytes("id"),
-        "/compare" => q.bytes("to"),
-        _ => q.bytes("rev"),
-    };
+    let revision = q.bytes("rev");
     let document = render::layout_page(
         &page,
         repo,
@@ -521,19 +597,67 @@ fn response(status: u16, content_type: &str, body: Body) -> Response<Body> {
         .header("content-security-policy","default-src 'none'; style-src 'self'; img-src 'none'; script-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
         .header("x-content-type-options","nosniff").header("referrer-policy","no-referrer").body(body).unwrap()
 }
-fn error_response(e: AppError, repo: Option<&[u8]>) -> Response<Body> {
-    let title = match e.status {
+fn view_error(e: AppError, path: &str, q: &Params) -> Response<Body> {
+    if !matches!(
+        path,
+        "/files" | "/history" | "/branches" | "/tags" | "/refs" | "/raw"
+    ) {
+        return error_response(e, None);
+    }
+    let mut body = format!("<p>{}</p>", render::escape(&e.message));
+    if path == "/files" && e.status == 422 && !q.bytes("path").is_empty() && !q.flag("source") {
+        let mut source = q.clone();
+        source.0.insert("source".into(), b"1".to_vec());
+        let args: Vec<_> = source
+            .0
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_slice()))
+            .collect();
+        body.push_str(&format!(
+            "<p><a href=\"{}\">View source</a></p>",
+            render::escape(&render::url("/files", &args))
+        ));
+    }
+    let mut page = types::Page::new(error_title(e.status), body);
+    page.show_heading = false;
+    page.active_tab = Some(match path {
+        "/history" => "History",
+        "/branches" | "/refs" => "Branches",
+        "/tags" => "Tags",
+        _ => "Files",
+    });
+    let revision = q.bytes("rev");
+    page.context = render::revision_context(revision, false);
+    page.breadcrumbs = Some(render::breadcrumbs(
+        q.bytes("repo"),
+        if path == "/files" {
+            q.bytes("path")
+        } else {
+            b""
+        },
+        Some(revision),
+        None,
+    ));
+    html(
+        e.status,
+        render::layout_page(&page, Some(q.bytes("repo")), Some(revision)).unwrap_or_default(),
+    )
+}
+
+fn error_title(status: u16) -> &'static str {
+    match status {
         404 => "Not found",
         403 => "Access denied",
         409 => "Destination exists",
         422 => "Cannot display this view",
         503 => "Busy",
         _ => "Request could not be completed",
-    };
-    let body = format!(
-        "<p>{}</p><p><a href=\"/\">Repositories</a> · <a href=\"/new\">New repository</a></p>",
-        render::escape(&e.message)
-    );
+    }
+}
+
+fn error_response(e: AppError, repo: Option<&[u8]>) -> Response<Body> {
+    let title = error_title(e.status);
+    let body = format!("<p>{}</p>", render::escape(&e.message));
     html(
         e.status,
         render::layout(title, repo, &body)
@@ -552,4 +676,67 @@ fn busy() -> Response<Body> {
         .headers_mut()
         .insert(header::RETRY_AFTER, "2".parse().unwrap());
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stalled_git_work_leaves_capacity_for_navigation() {
+        let runtime = http_runtime().unwrap();
+        runtime.block_on(async {
+            let root = std::env::current_dir().unwrap();
+            let app = Arc::new(App {
+                root: security::Root::new(&root).unwrap(),
+                config: Config {
+                    root,
+                    bind: "127.0.0.1:8080".parse().unwrap(),
+                    origin: "http://localhost".into(),
+                    host: "localhost".into(),
+                    ssh_prefix: None,
+                    branch: "main".into(),
+                },
+                secret: vec![0; 32],
+                jobs: Arc::new(Semaphore::new(ACTIVE_JOBS)),
+                queue: Arc::new(Semaphore::new(ADMITTED_JOBS)),
+            });
+            let mut stalled = Vec::new();
+            for index in 0..ACTIVE_JOBS - 1 {
+                let permit = app.jobs.clone().acquire_owned().await.unwrap();
+                let (release, wait) = std::sync::mpsc::channel();
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let job = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    started.send(()).unwrap();
+                    // Always release on test failure, too.
+                    let _ = wait.recv_timeout(Duration::from_secs(5));
+                });
+                stalled.push((release, job));
+                ready.await.unwrap();
+                if index == 0 {
+                    let request = Request::builder()
+                        .uri("/help")
+                        .header(header::HOST, "localhost")
+                        .body(Body::empty())
+                        .unwrap();
+                    let response = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        handle(State(app.clone()), request),
+                    )
+                    .await;
+                    assert_eq!(
+                        response
+                            .expect("one slow Git job must not block navigation")
+                            .status(),
+                        StatusCode::OK
+                    );
+                }
+            }
+            for (release, job) in stalled {
+                release.send(()).unwrap();
+                job.await.unwrap();
+            }
+        });
+    }
 }

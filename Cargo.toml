@@ -23,8 +23,7 @@ percent-encoding = "2"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 sha2 = "0.10"
 syntect = { version = "5.3", default-features = false, features = ["parsing", "html", "dump-load", "regex-onig"] }
-tokio = { version = "1", features = ["rt", "net", "sync", "time", "io-util", "fs"] }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "time"] }
 
 [build-dependencies]
 syntect = { version = "5.3", default-features = false, features = ["parsing", "yaml-load", "dump-create", "regex-onig"] }
