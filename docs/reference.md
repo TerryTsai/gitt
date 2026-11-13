@@ -42,6 +42,29 @@ are preserved.
 and [systemd](../deploy/gitt.service) examples are included. Adjust the binary
 path, repository root, user, group, and origin before installing a service.
 
+On Alpine, install the release to the service's binary location:
+
+```sh
+gitt_installer=$(mktemp)
+curl -fsSL https://raw.githubusercontent.com/TerryTsai/gitt/main/install.sh -o "$gitt_installer"
+doas env GITT_INSTALL_DIR=/usr/local/bin sh "$gitt_installer"
+rm -f "$gitt_installer"
+```
+
+Save the OpenRC script as `/etc/init.d/gitt` (mode `755`) and its configuration
+as `/etc/conf.d/gitt`. Set `gitt_user` to an existing unprivileged repository
+owner, or create the default `gitt` user and `git` group.
+Set `gitt_root`, `gitt_bind`, and `gitt_args` for the deployment, then enable it:
+
+```sh
+doas rc-update add gitt default
+doas rc-service gitt start
+```
+
+OpenRC supervises the process and sends its logs to syslog with the tag `gitt`.
+For updates, rerun the installer with `GITT_INSTALL_DIR=/usr/local/bin`, then
+run `doas rc-service gitt restart`.
+
 Anyone who can reach the configured origin can read and create repositories.
 For a reverse proxy, set `--origin` to the external URL and preserve its `Host`
 header. Forwarded headers are not used. Configure TLS and authentication at the

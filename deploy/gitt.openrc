@@ -1,16 +1,19 @@
 #!/sbin/openrc-run
 
 name="gitt"
-description="Read and create ordinary Git repositories"
+description="Git repository browser"
 command="/usr/local/bin/gitt"
 command_args="${gitt_root:-/srv/git} --bind ${gitt_bind:-127.0.0.1:8080} ${gitt_args}"
-command_user="gitt:git"
+command_user="${gitt_user:-gitt:git}"
 supervisor="supervise-daemon"
+output_logger="logger -t gitt"
+error_logger="logger -t gitt"
 respawn_delay=5
 respawn_max=5
 respawn_period=60
 
 depend() {
     need localmount
+    use net
     after firewall
 }
