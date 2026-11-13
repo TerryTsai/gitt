@@ -39,6 +39,9 @@ class Document(HTMLParser):
         self.stack: list[str] = []
         self.problems: list[str] = []
         self.links: list[str] = []
+        self.anchors: list[dict] = []
+        self.open_anchors: list[int] = []
+        self.navigation: list[str] = []
         self.inputs: dict[str, str] = {}
         self.tags: list[str] = []
         self.ids: list[str] = []
@@ -50,20 +53,24 @@ class Document(HTMLParser):
     def handle_starttag(self, tag, attributes):
         attrs = dict(attributes)
         self.tags.append(tag)
-        if tag == "script":
-            self.problems.append("script element")
+        if tag in {"script", "iframe", "embed", "object", "base"}:
+            self.problems.append(f"forbidden {tag} element")
+        if tag in {"details", "summary"} and "header" in self.stack and "Breadcrumb" not in self.navigation:
+            self.problems.append("unexpected header navigation disclosure")
         for name, value in attributes:
             if name.startswith("on"):
                 self.problems.append(f"event handler {name}")
             if name == "style":
                 self.problems.append("inline style")
-            if name == "class" and (tag != "span" or not ("pre" in self.stack or "code" in self.stack)):
+            if name == "class" and (tag != "span" or not ("pre" in self.stack and "code" in self.stack)):
                 self.problems.append(f"class on {tag} outside source highlighting")
             elif name == "class":
                 self.highlighted_spans += 1
             if name == "id":
+                if value in self.ids:
+                    self.problems.append(f"duplicate ID {value}")
                 self.ids.append(value or "")
-                if not re.fullmatch(r"(?:L|line-|old-|new-)\d+", value or ""):
+                if tag != "a" or "pre" not in self.stack or "code" not in self.stack or not re.fullmatch(r"L[1-9]\d*", value or ""):
                     self.problems.append(f"non-line ID {value}")
             if name in {"href", "src", "action"} and value and value.strip().lower().startswith("javascript:"):
                 self.problems.append("javascript URL")
@@ -75,18 +82,28 @@ class Document(HTMLParser):
             self.viewport = "width=device-width" in attrs.get("content", "")
         if tag == "a" and "href" in attrs:
             self.links.append(attrs["href"])
+            self.open_anchors.append(len(self.anchors))
+            self.anchors.append({"href": attrs["href"], "text": "", "navigation": self.navigation[-1] if self.navigation else None, "current": attrs.get("aria-current")})
+        if tag == "nav":
+            self.navigation.append(attrs.get("aria-label", ""))
         if tag == "input" and "name" in attrs:
             self.inputs[attrs["name"]] = attrs.get("value", "")
         if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
             self.stack.append(tag)
 
     def handle_endtag(self, tag):
+        if tag == "a" and self.open_anchors:
+            self.open_anchors.pop()
+        if tag == "nav" and self.navigation:
+            self.navigation.pop()
         if tag in self.stack:
             index = len(self.stack) - 1 - self.stack[::-1].index(tag)
             del self.stack[index:]
 
     def handle_data(self, value):
         self.text.append(value)
+        for index in self.open_anchors:
+            self.anchors[index]["text"] += value
 
 
 class Client:
@@ -223,7 +240,7 @@ class GittSmoke(unittest.TestCase):
         self.assertIn("team/empty.git", visible)
         self.assertNotIn("GITT_OUTSIDE_SECRET", visible)
         self.assertFalse(any("outside-repositories" in url for url in document.links))
-        filtered, _ = self.page("/", {"q": "archive"})
+        filtered, _ = self.page("/search", {"q": "archive"})
         repository_links = [url for url in filtered.links if urllib.parse.urlsplit(url).path == "/files"]
         self.assertTrue(any("archive" in url for url in repository_links))
         self.assertFalse(any(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("repo") == ["demo"] for url in repository_links))
@@ -231,7 +248,7 @@ class GittSmoke(unittest.TestCase):
     def test_02_checkout_and_committed_files(self):
         document, _ = self.page("/files", {"repo": "demo"})
         visible = " ".join(document.text)
-        self.assertIn("untracked.txt", visible)
+        self.assertNotIn("untracked.txt", visible)
         self.assertIn("tracked-ignored.txt", visible)
         self.assertNotIn("ignored.txt", [urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("path", [""])[0] for url in document.links])
         self.assertNotIn("ignored-dir", visible)
@@ -241,10 +258,11 @@ class GittSmoke(unittest.TestCase):
             self.assertTrue(source.ids, "Source lines need linkable anchors")
             self.assertGreater(source.highlighted_spans, 0, "Small Rust source should be highlighted on the server")
         source, _ = self.page("/files", {"repo": "demo", "path": "both.txt"})
-        self.assertIn("disk version", " ".join(source.text))
+        self.assertIn("original version", " ".join(source.text))
+        self.assertNotIn("disk version", " ".join(source.text))
         committed, _ = self.page("/files", {"repo": "demo", "path": "both.txt", "rev": "HEAD"})
         self.assertIn("original version", " ".join(committed.text))
-        filtered, _ = self.page("/files", {"repo": "demo", "q": "main.rs"})
+        filtered, _ = self.page("/search", {"repo": "demo", "q": "main.rs"})
         self.assertTrue(any(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("path") == ["src/main.rs"] for url in filtered.links))
 
     def test_03_byte_safe_paths_and_raw_attachment(self):
@@ -291,36 +309,30 @@ class GittSmoke(unittest.TestCase):
         self.assertIn(status, [400, 403, 404, 422])
         self.assertNotIn(b"GITT_OUTSIDE_SECRET", body)
 
-    def test_06_changes_history_and_refs(self):
-        changes, _ = self.page("/changes", {"repo": "demo"})
-        text = " ".join(changes.text)
-        for expected in ["Staged", "Unstaged", "Untracked", "staged.txt", "unstaged.txt", "both.txt", "untracked.txt"]:
-            self.assertIn(expected, text)
-        self.assertNotIn("IGNORED_UNTRACKED_SECRET", text)
+    def test_06_committed_history_branches_and_tags(self):
+        self.page("/changes", {"repo": "demo"}, expected=404)
         history, _ = self.page("/history", {"repo": "demo"})
-        commit_links = {url for url in history.links if urllib.parse.urlsplit(url).path == "/commit"}
+        commit_links = {anchor["href"] for anchor in history.anchors if not anchor["navigation"] and urllib.parse.urlsplit(anchor["href"]).path == "/history"}
         self.assertEqual(len(commit_links), 50)
         self.assertTrue(any(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("page") == ["1"] for url in history.links))
         older, _ = self.page("/history", {"repo": "demo", "page": "1"})
         self.assertIn("Initial fixture", " ".join(older.text))
-        refs, _ = self.page("/refs", {"repo": "demo"})
-        text = " ".join(refs.text)
-        for expected in ["main", "feature/example", "v0.1"]:
-            self.assertIn(expected, text)
+        branches, _ = self.page("/branches", {"repo": "demo"})
+        tags, _ = self.page("/tags", {"repo": "demo"})
+        def snapshots(document):
+            result = {}
+            for anchor in document.anchors:
+                target = urllib.parse.urlsplit(anchor["href"])
+                revision = urllib.parse.parse_qs(target.query).get("rev", [""])[0]
+                if not anchor["navigation"] and target.path in ["/branches", "/tags"] and revision.startswith("refs/"):
+                    result[anchor["text"].strip()] = revision
+            return result
+        self.assertEqual(snapshots(branches), {"main": "refs/heads/main", "feature/example": "refs/heads/feature/example"})
+        self.assertEqual(snapshots(tags), {"v0.1": "refs/tags/v0.1"})
 
-    def test_07_root_merge_and_snapshot_comparison(self):
-        fixture = MANIFEST["fixtures"]
-        root, _ = self.page("/commit", {"repo": "demo", "id": fixture["root_commit"]})
-        self.assertIn("Initial fixture", " ".join(root.text))
-        merge, _ = self.page("/commit", {"repo": "demo", "id": fixture["merge_commit"]})
-        self.assertIn("Merge example feature", " ".join(merge.text))
-        self.assertIn("parent", " ".join(merge.text).lower())
-        comparison, _ = self.page("/compare", {"repo": "demo", "from": "v0.1", "to": "feature/example"})
-        text = " ".join(comparison.text)
-        self.assertIn("feature.txt", text)
-        # Endpoint comparison also includes changes on main since the feature fork.
-        self.assertIn("history.txt", text)
-        self.assertTrue("+" in text and "-" in text)
+    def test_07_removed_commit_and_compare_views(self):
+        for route in ["/commit", "/compare"]:
+            self.page(route, {"repo": "demo"}, expected=404)
 
     def test_08_empty_missing_binary_and_shallow(self):
         for repo in ["team/empty.git", "empty-checkout"]:
@@ -329,13 +341,13 @@ class GittSmoke(unittest.TestCase):
         self.page("/files", {"repo": "absent-repository"}, expected=404)
         binary, _ = self.page("/files", {"repo": "demo", "path": "binary.dat"})
         self.assertIn("binary", " ".join(binary.text).lower())
-        shallow, _ = self.page("/history", {"repo": "shallow"})
-        self.assertIn("shallow", " ".join(shallow.text).lower())
+        shallow, body = self.page("/history", {"repo": "shallow"})
+        self.assertIn(b"shallow", body.lower())
 
     def test_09_host_and_creation_csrf(self):
         status, _, _ = self.client.request("/", headers={"Host": "attacker.invalid"})
         self.assertIn(status, [400, 403])
-        fields = {"path": self.created_prefix + "/csrf-refused", "kind": "bare", "branch": "main"}
+        fields = {"path": self.created_prefix + "/csrf-refused", "bare": "1", "branch": "main"}
         status, _, _ = self.client.request("/new", form=fields)
         self.assertEqual(status, 403)
         page, _ = self.page("/new")
@@ -354,7 +366,10 @@ class GittSmoke(unittest.TestCase):
 
     def create(self, path, kind="bare", branch="main"):
         form, _ = self.page("/new")
-        return self.client.request("/new", form={"path": path, "kind": kind, "branch": branch, "csrf": form.inputs["csrf"]})
+        fields = {"path": path, "branch": branch, "csrf": form.inputs["csrf"]}
+        if kind == "bare":
+            fields["bare"] = "1"
+        return self.client.request("/new", form=fields)
 
     def test_10_create_bare_checkout_and_no_overwrite(self):
         for name, kind, branch in [("bare.git", "bare", "main"), ("checkout with spaces", "checkout", "trunk")]:
@@ -393,7 +408,7 @@ class GittSmoke(unittest.TestCase):
         tokens = [Document(client.request("/new")[2]).inputs["csrf"] for client in clients]
         def attempt(pair):
             client, token = pair
-            return client.request("/new", form={"path": path, "kind": "bare", "branch": "main", "csrf": token})[0]
+            return client.request("/new", form={"path": path, "bare": "1", "branch": "main", "csrf": token})[0]
         with ThreadPoolExecutor(max_workers=2) as pool:
             statuses = sorted(pool.map(attempt, zip(clients, tokens)))
         self.assertEqual(statuses, [303, 409])
@@ -405,16 +420,13 @@ class GittSmoke(unittest.TestCase):
             status, _, body = self.client.request("/files", {"repo": repo})
             self.assertEqual(status, 422, body[:500])
             self.assertNotIn(b"GITT_OUTSIDE_SECRET", body)
-        status, _, body = self.client.request("/changes", {"repo": "security/filters"})
-        self.assertIn(status, [200, 422], body[:500])
-        self.assertIn(b"filter", body.lower())
-        self.assertRegex(body.lower(), rb"unavailable|unsupported|not executed|no filter")
+        self.page("/files", {"repo": "security/filters"})
+        self.page("/changes", {"repo": "security/filters"}, expected=404)
         for marker in ["filter-executed", "diff-executed", "fsmonitor-executed", "hook-executed"]:
             if self.inspector:
                 self.assertFalse(self.inspector.exists("security/filters/.git/" + marker), marker)
-        status, _, body = self.client.request("/changes", {"repo": "security/conflict"})
-        self.assertIn(status, [200, 422])
-        self.assertIn(b"conflict", body.lower())
+        self.page("/files", {"repo": "security/conflict"})
+        self.page("/changes", {"repo": "security/conflict"}, expected=404)
 
     def test_13_malformed_and_oversized_requests(self):
         status, _, _ = self.client.request("/files?repo=demo&repo=archive.git")
@@ -446,6 +458,31 @@ class GittSmoke(unittest.TestCase):
             with self.subTest(method=method, route=route):
                 status, _, _ = self.client.request(route, method=method)
                 self.assertEqual(status, 405)
+
+    def test_17_compact_navigation_and_pinned_snapshot(self):
+        home, _ = self.page("/")
+        create = [anchor for anchor in home.anchors if urllib.parse.urlsplit(anchor["href"]).path == "/new"]
+        self.assertEqual([anchor["text"].strip() for anchor in create], ["Create"])
+        snapshot = MANIFEST["fixtures"]["feature_commit"]
+        source, _ = self.page("/files", {"repo": "archive.git", "path": "src/main.rs", "rev": snapshot})
+        navigation = {anchor["text"].strip(): anchor for anchor in source.anchors if anchor["navigation"] == "Repository"}
+        self.assertEqual(set(navigation), {"Files", "History", "Branches", "Tags"})
+        self.assertEqual(navigation["Files"]["current"], "page")
+        for name, route in [("Files", "/files"), ("History", "/history"), ("Branches", "/branches"), ("Tags", "/tags")]:
+            target = urllib.parse.urlsplit(navigation[name]["href"])
+            self.assertEqual(target.path, route)
+            self.assertEqual(urllib.parse.parse_qs(target.query).get("rev"), [snapshot])
+        parents = [urllib.parse.urlsplit(anchor["href"]) for anchor in source.anchors if anchor["navigation"] == "Parent folders" and urllib.parse.urlsplit(anchor["href"]).path == "/files"]
+        self.assertTrue(any(urllib.parse.parse_qs(parent.query).get("path") == ["src"] for parent in parents))
+        for parent in parents:
+            query = urllib.parse.parse_qs(parent.query)
+            self.assertEqual(query.get("repo"), ["archive.git"])
+            self.assertEqual(query.get("rev"), [snapshot])
+        checkout, _ = self.page("/files", {"repo": "demo"})
+        self.assertNotIn("Changes", [anchor["text"].strip() for anchor in checkout.anchors if anchor["navigation"] == "Repository"])
+        for route, params in [("/new", None), ("/help", None), ("/files", {"repo": "demo"}), ("/branches", {"repo": "demo"}), ("/tags", {"repo": "demo"})]:
+            page, _ = self.page(route, params)
+            self.assertFalse(any(urllib.parse.urlsplit(url).path == "/new" for url in page.links), f"Create link is not home-only: {route}")
 
 
 def main():
