@@ -9,28 +9,22 @@
 </head>
 <body>
 <header>
-<a href="/"><strong>gitt</strong></a>
-<details>
-<summary>Menu</summary>
-<nav aria-label="Site">
-<a href="/">Repositories</a>
-<a href="/new">Create repository</a>
+<nav aria-label="Breadcrumb">
+{{ breadcrumbs|safe }}
 </nav>
-{% if !repo_name.is_empty() %}
-<p><code>{{ repo_name }}</code></p>
+<nav aria-label="Page actions">{{ actions|safe }}{% if show_create %}<a href="/new">Create</a>{% endif %}<a href="{{ search_url }}">Search</a></nav>
+{% if !tabs.is_empty() %}
+<div aria-label="Repository toolbar">
 <nav aria-label="Repository">
-{% for tab in tabs %}<a href="{{ tab.href }}">{{ tab.label }}</a>{% endfor %}
-<a href="">Refresh</a>
+{% for tab in tabs %}<a href="{{ tab.href }}"{% if tab.active %} aria-current="page"{% endif %}>{{ tab.label }}</a>{% endfor %}
 </nav>
+<p aria-label="Current revision">{{ context|safe }}</p>
+</div>
 {% endif %}
-</details>
 </header>
 <main>
-<h1>{{ heading|safe }}</h1>
+{% if show_heading %}<h1>{{ heading|safe }}</h1>{% endif %}
 {{ body|safe }}
 </main>
-<footer>
-<p>gitt · <a href="/help">Help and limits</a></p>
-</footer>
 </body>
 </html>

@@ -129,6 +129,16 @@ pub struct Page {
     pub title: String,
     /// Optional application HTML for a linked heading; repository text is escaped.
     pub heading: Option<String>,
+    /// Optional application HTML for the breadcrumb; repository bytes are escaped.
+    pub breadcrumbs: Option<String>,
+    pub active_tab: Option<&'static str>,
+    /// The user's selected reference or commit, preserved without resolving to a hash.
+    pub revision: Option<Vec<u8>>,
+    pub show_heading: bool,
+    pub show_create: bool,
+    /// Trusted action links and plain-text markup for the selected revision.
+    pub actions: String,
+    pub context: String,
     pub body: String,
 }
 impl Page {
@@ -136,6 +146,13 @@ impl Page {
         Self {
             title: title.into(),
             heading: None,
+            breadcrumbs: None,
+            active_tab: None,
+            revision: None,
+            show_heading: true,
+            show_create: false,
+            actions: String::new(),
+            context: String::new(),
             body: body.into(),
         }
     }

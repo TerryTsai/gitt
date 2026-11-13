@@ -134,6 +134,7 @@ pub fn url(route: &str, args: &[(&str, &[u8])]) -> String {
 struct Tab {
     label: &'static str,
     href: String,
+    active: bool,
 }
 
 #[derive(Template)]
@@ -141,10 +142,122 @@ struct Tab {
 struct Layout<'a> {
     title: &'a str,
     heading: String,
+    show_heading: bool,
+    show_create: bool,
+    breadcrumbs: String,
     stylesheet: &'static str,
-    repo_name: String,
     tabs: Vec<Tab>,
+    search_url: String,
+    actions: &'a str,
+    context: &'a str,
     body: &'a str,
+}
+
+pub fn revision_text(revision: &[u8]) -> String {
+    if revision.len() == 40 && revision.iter().all(u8::is_ascii_hexdigit) {
+        return display(&revision[..7]);
+    }
+    display(
+        revision
+            .strip_prefix(b"refs/heads/")
+            .or_else(|| revision.strip_prefix(b"refs/tags/"))
+            .or_else(|| revision.strip_prefix(b"refs/remotes/"))
+            .unwrap_or(if revision.is_empty() {
+                b"HEAD"
+            } else {
+                revision
+            }),
+    )
+}
+
+pub fn revision_context(revision: &[u8], shallow: bool) -> String {
+    let name = escape(&revision_text(revision));
+    let mut title = display(revision);
+    if shallow {
+        title.push_str(" · shallow repository");
+    }
+    let text = if revision.len() == 40 && revision.iter().all(u8::is_ascii_hexdigit) {
+        format!("<code>{name}</code>")
+    } else {
+        name
+    };
+    format!("<span title=\"{}\">{text}</span>", escape(&title))
+}
+
+/// Keep the current location visible. Ancestors remain accessible in a native
+/// disclosure, with byte-preserving links and no extra mobile header row.
+pub fn breadcrumbs(
+    repo: &[u8],
+    path: &[u8],
+    revision: Option<&[u8]>,
+    current_suffix: Option<&str>,
+) -> String {
+    let repo_label = if repo.is_empty() {
+        ".".to_owned()
+    } else {
+        display(repo)
+    };
+    let mut full_path = repo_label.clone();
+    if !path.is_empty() {
+        full_path.push('/');
+        full_path.push_str(&display(path));
+    }
+    if let Some(suffix) = current_suffix {
+        full_path.push_str(" / ");
+        full_path.push_str(suffix);
+    }
+    let mut items = vec![(repo_label, Vec::new())];
+    let mut cumulative = Vec::new();
+    for segment in path
+        .split(|byte| *byte == b'/')
+        .filter(|part| !part.is_empty())
+    {
+        if !cumulative.is_empty() {
+            cumulative.push(b'/');
+        }
+        cumulative.extend_from_slice(segment);
+        items.push((display(segment), cumulative.clone()));
+    }
+    let current = current_suffix
+        .map(str::to_owned)
+        .unwrap_or_else(|| items.pop().expect("repository breadcrumb").0);
+    let home = if let Some(revision) = revision.filter(|value| !value.is_empty()) {
+        url("/", &[("repo", repo), ("rev", revision)])
+    } else {
+        "/".to_owned()
+    };
+    let mut html = format!("<a href=\"{}\">gitt</a>", escape(&home));
+    let separator = "<b aria-hidden=\"true\">/</b>";
+    let link = |name: &str, path: &[u8]| {
+        let mut args = vec![("repo", repo)];
+        if !path.is_empty() {
+            args.push(("path", path));
+        }
+        if let Some(revision) = revision.filter(|value| !value.is_empty()) {
+            args.push(("rev", revision));
+        }
+        format!(
+            "<a href=\"{}\">{}</a>",
+            escape(&url("/files", &args)),
+            escape(name)
+        )
+    };
+    if !items.is_empty() {
+        html.push_str(separator);
+        html.push_str("<details><summary aria-label=\"Parent folders\" title=\"Parent folders\">…</summary><nav aria-label=\"Parent folders\">");
+        for (name, path) in &items {
+            html.push_str(&link(name, path));
+        }
+        html.push_str("</nav></details>");
+    }
+    html.push_str(separator);
+    let _ = write!(
+        html,
+        "<strong title=\"{}\">{}</strong>",
+        escape(&full_path),
+        escape(&current)
+    );
+    html
 }
 
 /// `body` must already be trusted application HTML, with repository text escaped.
@@ -152,91 +265,113 @@ pub fn layout(title: &str, repo: Option<&[u8]>, body: &str) -> Result<String> {
     layout_with_revision(title, repo, None, body)
 }
 
-/// Keep an explicitly selected snapshot when moving between Files and History.
+/// Keep the selected reference or commit when moving between repository views.
 pub fn layout_with_revision(
     title: &str,
     repo: Option<&[u8]>,
     revision: Option<&[u8]>,
     body: &str,
 ) -> Result<String> {
-    layout_document(title, None, repo, revision, body)
+    layout_page(&Page::new(title, body), repo, revision)
 }
 
 pub fn layout_page(page: &Page, repo: Option<&[u8]>, revision: Option<&[u8]>) -> Result<String> {
-    layout_document(
-        &page.title,
-        page.heading.as_deref(),
-        repo,
-        revision,
-        &page.body,
-    )
-}
-
-fn layout_document(
-    title: &str,
-    heading: Option<&str>,
-    repo: Option<&[u8]>,
-    revision: Option<&[u8]>,
-    body: &str,
-) -> Result<String> {
-    if body.len() > HTML_LIMIT {
+    let revision = page.revision.as_deref().or(revision);
+    if page
+        .body
+        .len()
+        .saturating_add(page.actions.len())
+        .saturating_add(page.context.len())
+        > HTML_LIMIT
+    {
         return Err(output_limit());
     }
     let tabs = repo
         .map(|repo| {
             [
                 ("Files", "/files"),
-                ("Changes", "/changes"),
                 ("History", "/history"),
-                ("Branches & tags", "/refs"),
-                ("Compare", "/compare"),
+                ("Branches", "/branches"),
+                ("Tags", "/tags"),
             ]
             .into_iter()
             .map(|(label, route)| {
                 let mut args = vec![("repo", repo)];
-                if matches!(route, "/files" | "/history")
-                    && let Some(revision) = revision.filter(|revision| !revision.is_empty())
-                {
+                if let Some(revision) = revision.filter(|revision| !revision.is_empty()) {
                     args.push(("rev", revision));
                 }
                 Tab {
                     label,
                     href: url(route, &args),
+                    active: page.active_tab == Some(label),
                 }
             })
             .collect()
         })
         .unwrap_or_default();
-    let title = if title.is_empty() {
+    let title = if page.title.is_empty() {
         "Repository"
     } else {
-        title
+        &page.title
     };
     // A new embedded stylesheet must not reuse an earlier build's cached URL.
     static STYLESHEET: OnceLock<String> = OnceLock::new();
-    let page = Layout {
+    let layout = Layout {
         title,
-        heading: heading.map(str::to_owned).unwrap_or_else(|| escape(title)),
+        heading: page.heading.clone().unwrap_or_else(|| escape(title)),
+        show_heading: page.show_heading,
+        show_create: page.show_create && repo.is_none(),
+        breadcrumbs: page.breadcrumbs.clone().unwrap_or_else(|| match repo {
+            Some(repo) => breadcrumbs(repo, b"", revision, None),
+            None if page.show_create => "<a href=\"/\">gitt</a>".to_owned(),
+            None => format!(
+                "<a href=\"/\">gitt</a><b aria-hidden=\"true\">/</b><strong>{}</strong>",
+                escape(title)
+            ),
+        }),
         stylesheet: STYLESHEET
             .get_or_init(|| format!("/style.css?v={:x}", Sha256::digest(CSS.as_bytes()))),
-        repo_name: repo
-            .map(|repo| {
-                if repo.is_empty() {
-                    ".".to_owned()
-                } else {
-                    display(repo)
-                }
-            })
-            .unwrap_or_default(),
         tabs,
-        body,
-    }
-    .render()
-    .map_err(|_| AppError::new(500, "The page could not be rendered."))?;
-    if page.len() > HTML_LIMIT {
+        search_url: match repo {
+            Some(repo) => {
+                let mut args = vec![("repo", repo)];
+                if let Some(revision) = revision.filter(|value| !value.is_empty()) {
+                    args.push(("rev", revision));
+                }
+                url("/search", &args)
+            }
+            None => "/search".into(),
+        },
+        actions: &page.actions,
+        context: &page.context,
+        body: &page.body,
+    };
+    // Askama's static size hint excludes the source body. Without reserving
+    // room for it, appending the closing tags can double a multi-megabyte
+    // buffer. Include the dynamic header and a small allowance for markup.
+    let mut document = String::with_capacity(
+        (layout.body.len()
+            + layout.search_url.len() * 6
+            + layout.actions.len()
+            + layout.context.len()
+            + layout.breadcrumbs.len()
+            + layout.heading.len()
+            + layout.title.len() * 12
+            + layout
+                .tabs
+                .iter()
+                .map(|tab| tab.href.len() * 6)
+                .sum::<usize>()
+            + 4096)
+            .min(HTML_LIMIT),
+    );
+    layout
+        .render_into(&mut document)
+        .map_err(|_| AppError::new(500, "The page could not be rendered."))?;
+    if document.len() > HTML_LIMIT {
         return Err(output_limit());
     }
-    Ok(page)
+    Ok(document)
 }
 
 #[cfg(test)]
@@ -244,7 +379,7 @@ pub fn file_content(path: &[u8], data: &[u8], markdown: bool) -> Result<String> 
     file_content_inner(path, data, markdown, None)
 }
 
-/// The revision is absent for a working tree, or the pinned snapshot's revision.
+/// File navigation retains the selected branch, tag, or commit.
 pub fn file_content_with_context(
     path: &[u8],
     data: &[u8],
@@ -263,16 +398,16 @@ fn file_content_inner(
 ) -> Result<String> {
     if data.len() > TEXT_LIMIT {
         return Err(AppError::limit(
-            "Text previews are limited to 1 MiB. Download the raw file or use local Git.",
+            "Text previews are limited to 1 MiB. Use local Git to inspect this file.",
         ));
     }
     let text = match std::str::from_utf8(data) {
         Ok(text) if !data.contains(&0) => text,
-        _ => return Ok("<p>This file contains binary data or text that is not UTF-8. Download the raw file to inspect it.</p>".to_owned()),
+        _ => return Ok("<p>This file contains binary data or text that is not UTF-8. Use local Git to inspect it.</p>".to_owned()),
     };
     if text.lines().count() > LINE_LIMIT {
         return Err(AppError::limit(
-            "Text previews are limited to 20,000 lines. Download the raw file or use local Git.",
+            "Text previews are limited to 20,000 lines. Use local Git to inspect this file.",
         ));
     }
     if text.is_empty() {
@@ -292,10 +427,10 @@ fn file_content_inner(
 
 fn plain_source(text: &str) -> Result<String> {
     let mut html = String::with_capacity(text.len().min(FRAGMENT_LIMIT) + 128);
-    html.push_str("<p><small>Plain text preview. Highlighting was skipped because of the file type, size, or time limit.</small></p><pre tabindex=\"0\" aria-label=\"File contents\"><code>");
+    html.push_str("<pre tabindex=\"0\" aria-label=\"File contents\"><code>");
     for (index, line) in LinesWithEndings::from(text).enumerate() {
-        line_anchor(&mut html, index + 1);
-        for ch in line.chars() {
+        source_row(&mut html, index + 1);
+        for ch in source_line(line).chars() {
             match ch {
                 '&' => html.push_str("&amp;"),
                 '<' => html.push_str("&lt;"),
@@ -308,16 +443,26 @@ fn plain_source(text: &str) -> Result<String> {
                 return Err(output_limit());
             }
         }
+        html.push_str("</span></span>");
+        if html.len() > FRAGMENT_LIMIT {
+            return Err(output_limit());
+        }
     }
     html.push_str("</code></pre>");
     Ok(html)
 }
 
-fn line_anchor(html: &mut String, line: usize) {
+fn source_row(html: &mut String, line: usize) {
     let _ = write!(
         html,
-        "<a id=\"L{line}\" href=\"#L{line}\" aria-label=\"Line {line}\">{line}</a> "
+        "<span><a id=\"L{line}\" href=\"#L{line}\" aria-label=\"Line {line}\">{line}</a><span>"
     );
+}
+
+fn source_line(line: &str) -> &str {
+    line.strip_suffix("\r\n")
+        .or_else(|| line.strip_suffix('\n'))
+        .unwrap_or(line)
 }
 
 fn highlighted_source(path: &[u8], text: &str) -> Option<String> {
@@ -332,29 +477,46 @@ fn highlighted_source(path: &[u8], text: &str) -> Option<String> {
     let syntax = syntaxes.find_syntax_by_name(name)?;
     let mut parser = ParseState::new(syntax);
     let mut scopes = ScopeStack::new();
-    let mut open_spans = 0isize;
     let mut html = String::with_capacity(text.len().saturating_mul(2).min(FRAGMENT_LIMIT));
     html.push_str("<pre tabindex=\"0\" aria-label=\"File contents\"><code>");
     for (index, line) in LinesWithEndings::from(text).enumerate() {
         if started.elapsed() > HIGHLIGHT_BUDGET {
             return None;
         }
-        let operations = parser.parse_line(line, &syntaxes).ok()?;
-        let (fragment, delta) =
-            line_tokens_to_classed_spans(line, &operations, ClassStyle::Spaced, &mut scopes)
-                .ok()?;
-        open_spans += delta;
-        if !(0..=1024).contains(&open_spans) || html.len() + fragment.len() + 128 > FRAGMENT_LIMIT {
+        let mut operations = parser.parse_line(line, &syntaxes).ok()?;
+        let visible = source_line(line);
+        // The parser still sees line endings, but table rows provide the visual
+        // line break. End-of-line scope changes belong at the final text offset.
+        for (offset, _) in &mut operations {
+            *offset = (*offset).min(visible.len());
+        }
+        source_row(&mut html, index + 1);
+        // Syntect scopes can cross physical lines. Reopen them inside this row
+        // and close them at its end so no token span can contain another row.
+        if scopes.len() > 1024 {
             return None;
         }
-        line_anchor(&mut html, index + 1);
+        for scope in scopes.as_slice() {
+            let classes = scope.to_string().replace('.', " ");
+            let _ = write!(html, "<span class=\"{}\">", escape(&classes));
+        }
+        let (fragment, delta) =
+            line_tokens_to_classed_spans(visible, &operations, ClassStyle::Spaced, &mut scopes)
+                .ok()?;
+        if !(-1024..=1024).contains(&delta)
+            || scopes.len() > 1024
+            || html.len() + fragment.len() + scopes.len() * 7 + 32 > FRAGMENT_LIMIT
+        {
+            return None;
+        }
         html.push_str(&fragment);
+        for _ in 0..scopes.len() {
+            html.push_str("</span>");
+        }
+        html.push_str("</span></span>");
     }
     if started.elapsed() > HIGHLIGHT_BUDGET {
         return None;
-    }
-    for _ in 0..open_spans {
-        html.push_str("</span>");
     }
     html.push_str("</code></pre>");
     if html.len() > FRAGMENT_LIMIT {
@@ -443,7 +605,7 @@ fn markdown_content(
     pulldown_cmark::html::write_html_io(&mut output, parser).map_err(|_| output_limit())?;
     if exceeded.get() {
         return Err(AppError::limit(
-            "This Markdown document exceeds the rendering complexity limit. Open its source or raw download.",
+            "This Markdown document exceeds the rendering complexity limit. Open its source or use local Git.",
         ));
     }
     let html = std::str::from_utf8(&output.0)
@@ -583,7 +745,7 @@ impl io::Write for LimitedWriter {
 
 fn output_limit() -> AppError {
     AppError::limit(
-        "This preview exceeds the 2 MiB page limit. Open a smaller file or use the raw download.",
+        "This preview exceeds the 2 MiB page limit. Open a smaller file or use local Git.",
     )
 }
 
@@ -622,13 +784,54 @@ mod tests {
         let html = layout("", Some(b""), "<p>Files</p>").unwrap();
         assert!(html.contains("<h1>Repository</h1>"));
         assert!(html.contains("/history?repo="));
-        assert!(html.contains("<code>.</code>"));
+        assert!(html.contains("<strong title=\".\">.</strong>"));
     }
 
     #[test]
     fn snapshot_tabs_preserve_the_selected_revision() {
         let html = layout_with_revision("Files", Some(b"demo"), Some(b"deadbeef"), "").unwrap();
-        assert_eq!(html.matches("rev=deadbeef").count(), 2);
+        assert_eq!(html.matches("rev=deadbeef").count(), 6);
+    }
+
+    #[test]
+    fn breadcrumb_menu_preserves_bytes_snapshot_and_parent_links() {
+        let html = breadcrumbs(
+            b"team/repo&\xff",
+            b"src/deep/<parent>/a\"\xff.rs",
+            Some(b"topic/a&b"),
+            None,
+        );
+        assert!(!html.contains("<parent>"));
+        assert!(html.contains("&lt;parent&gt;"));
+        assert!(html.contains("a&quot;\\xFF.rs"));
+        assert!(html.contains("path=src%2Fdeep%2F%3Cparent%3E&amp;rev=topic%2Fa%26b"));
+        let menu_end = html.find("</nav></details>").unwrap();
+        let parent = html.rfind("&lt;parent&gt;</a>").unwrap();
+        assert!(parent < menu_end);
+        assert!(html[menu_end..].contains("<strong"));
+        for anchor in html.split("href=\"").skip(2) {
+            let href = anchor.split('"').next().unwrap().replace("&amp;", "&");
+            let params = crate::types::Params::parse(href.split_once('?').unwrap().1).unwrap();
+            assert_eq!(params.bytes("repo"), b"team/repo&\xff");
+            assert_eq!(params.bytes("rev"), b"topic/a&b");
+        }
+    }
+
+    #[test]
+    fn page_navigation_reflects_repository_context() {
+        let mut page = Page::new("Files", "<p>Contents</p>");
+        page.show_heading = false;
+        page.active_tab = Some("Files");
+        page.show_create = true;
+        let html = layout_page(&page, Some(b"demo.git"), None).unwrap();
+        assert!(!html.contains("<h1>"));
+        assert!(!html.contains("/changes?"));
+        assert!(!html.contains("href=\"/new\""));
+        assert!(html.contains("/branches?repo=demo%2Egit"));
+        assert!(html.contains("/tags?repo=demo%2Egit"));
+        assert!(html.contains("aria-current=\"page\">Files</a>"));
+        let html = layout_page(&page, None, None).unwrap();
+        assert!(html.contains("href=\"/new\">Create</a>"));
     }
 
     #[test]
@@ -669,6 +872,45 @@ mod tests {
         assert!(html.contains("id=\"L1\""));
         assert!(html.contains("id=\"L2\""));
         assert!(!html.contains("id=\"L3\""));
+    }
+
+    #[test]
+    fn multiline_highlighting_keeps_line_rows_independent() {
+        let html = highlighted_source(b"main.rs", "/* first\r\nsecond */\r\nfn main() {}\n")
+            .expect("small Rust source should be highlighted");
+        let mut stack = Vec::new();
+        let mut anchors = 0;
+        for part in html.split('<').skip(1) {
+            let tag = part.split('>').next().unwrap();
+            if let Some(closing) = tag.strip_prefix('/') {
+                assert_eq!(stack.pop(), Some(closing));
+            } else {
+                let name = tag.split_whitespace().next().unwrap();
+                if tag.starts_with("a id=") {
+                    assert_eq!(stack, ["pre", "code", "span"]);
+                    anchors += 1;
+                }
+                stack.push(name);
+            }
+        }
+        assert!(stack.is_empty());
+        assert_eq!(anchors, 3);
+        let second = html
+            .split("id=\"L2\"")
+            .nth(1)
+            .unwrap()
+            .split("id=\"L3\"")
+            .next()
+            .unwrap();
+        assert!(second.contains("class=\"comment block"));
+        let text: String = second
+            .split('>')
+            .skip(1)
+            .filter_map(|part| part.split('<').next())
+            .collect();
+        assert!(text.contains("second */"));
+        assert!(!html.contains('\r'));
+        assert!(!html.contains('\n'));
     }
 
     #[test]
