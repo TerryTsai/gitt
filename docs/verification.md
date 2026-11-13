@@ -42,8 +42,10 @@ of running gitt.
 Browser checks reject scripts, external resource requests, unexpected classes or
 IDs, missing labels, and page-wide overflow. They exercise repository/path search,
 Markdown/source navigation, line links, refresh, and revision-preserving links.
-Code is allowed to scroll horizontally. The README screenshots are real browser
-captures, updated for the mobile layout follow-up below.
+Code is allowed to scroll horizontally. The current README screenshots use the
+actual interface with illustrative repositories; see their
+[capture notes](screenshots/README.md). The measurements below describe the
+historical layout checks.
 
 ## Mobile layout follow-up — 2026-11-13
 
